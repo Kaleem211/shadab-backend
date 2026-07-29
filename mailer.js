@@ -1,5 +1,5 @@
 const FROM_NAME = process.env.MAIL_FROM_NAME || "Shadab Restaurant";
-const FROM_EMAIL = process.env.GMAIL_USER;
+const FROM_EMAIL = "kaleem.shaik.ai@gmail.com";
 const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
 async function sendOtpEmail(to, code, purpose) {
