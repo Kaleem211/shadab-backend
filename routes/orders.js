@@ -4,57 +4,63 @@ const db = require("../db");
 const { requireAuth, requireAdmin } = require("../utils/auth");
 
 const router = express.Router();
+const ordersCol = db.collection("orders");
 
-/* Customer places an order */
-router.post("/", requireAuth, (req, res) => {
-  const { customerName, customerPhone, items, total } = req.body || {};
-  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: "Cart is empty." });
-  if (typeof total !== "number") return res.status(400).json({ error: "Missing order total." });
+router.post("/", requireAuth, async (req, res) => {
+  try {
+    const { customerName, customerPhone, items, total } = req.body || {};
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: "Cart is empty." });
+    if (typeof total !== "number") return res.status(400).json({ error: "Missing order total." });
 
-  const id = "ORD-" + Date.now().toString(36).toUpperCase() + crypto.randomBytes(2).toString("hex").toUpperCase();
-  db.prepare(`INSERT INTO orders (id, user_mobile, customer_name, customer_phone, items_json, total)
-              VALUES (?, ?, ?, ?, ?, ?)`)
-    .run(id, req.user.mobile, customerName || req.user.username, customerPhone || req.user.mobile, JSON.stringify(items), total);
-
-  const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
-  res.json({ ok: true, order: formatOrder(order) });
+    const id = "ORD-" + Date.now().toString(36).toUpperCase() + crypto.randomBytes(2).toString("hex").toUpperCase();
+    const order = {
+      id,
+      userMobile: req.user.mobile,
+      customerName: customerName || req.user.username,
+      customerPhone: customerPhone || req.user.mobile,
+      items,
+      total,
+      status: "placed",
+      createdAt: new Date().toISOString(),
+    };
+    await ordersCol.doc(id).set(order);
+    res.json({ ok: true, order });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't place the order." });
+  }
 });
 
-/* Customer's own orders */
-router.get("/mine", requireAuth, (req, res) => {
-  const rows = db.prepare("SELECT * FROM orders WHERE user_mobile = ? ORDER BY created_at DESC").all(req.user.mobile);
-  res.json({ ok: true, orders: rows.map(formatOrder) });
+router.get("/mine", requireAuth, async (req, res) => {
+  const snap = await ordersCol.where("userMobile", "==", req.user.mobile).get();
+  const orders = [];
+  snap.forEach((doc) => orders.push(doc.data()));
+  orders.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  res.json({ ok: true, orders });
 });
 
-/* Admin: all orders */
-router.get("/", requireAdmin, (req, res) => {
-  const rows = db.prepare("SELECT * FROM orders ORDER BY created_at DESC").all();
-  res.json({ ok: true, orders: rows.map(formatOrder) });
+router.get("/", requireAdmin, async (req, res) => {
+  const snap = await ordersCol.get();
+  const orders = [];
+  snap.forEach((doc) => orders.push(doc.data()));
+  orders.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  res.json({ ok: true, orders });
 });
 
-/* Admin: mark delivered */
-router.patch("/:id/deliver", requireAdmin, (req, res) => {
-  const info = db.prepare("UPDATE orders SET status = 'delivered' WHERE id = ?").run(req.params.id);
-  if (!info.changes) return res.status(404).json({ error: "Order not found." });
+router.patch("/:id/deliver", requireAdmin, async (req, res) => {
+  const ref = ordersCol.doc(req.params.id);
+  const doc = await ref.get();
+  if (!doc.exists) return res.status(404).json({ error: "Order not found." });
+  await ref.update({ status: "delivered" });
   res.json({ ok: true });
 });
 
-/* Admin: clear all orders */
-router.delete("/", requireAdmin, (req, res) => {
-  db.prepare("DELETE FROM orders").run();
+router.delete("/", requireAdmin, async (req, res) => {
+  const snap = await ordersCol.get();
+  const batch = db.batch();
+  snap.forEach((doc) => batch.delete(doc.ref));
+  await batch.commit();
   res.json({ ok: true });
 });
-
-function formatOrder(row) {
-  return {
-    id: row.id,
-    customerName: row.customer_name,
-    customerPhone: row.customer_phone,
-    items: JSON.parse(row.items_json),
-    total: row.total,
-    status: row.status,
-    createdAt: row.created_at,
-  };
-}
 
 module.exports = router;
