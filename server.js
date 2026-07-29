@@ -15,6 +15,7 @@ const settingsRoutes = require("./routes/settings");
 });
 
 const app = express();
+app.set("trust proxy", 1); // Render sits behind a proxy — needed for express-rate-limit to see real client IPs
 app.use(express.json());
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
