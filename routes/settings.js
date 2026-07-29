@@ -3,18 +3,18 @@ const db = require("../db");
 const { requireAdmin } = require("../utils/auth");
 
 const router = express.Router();
+const settingsCol = db.collection("settings");
 const DEFAULT_CLOSING_TIME = "19:15";
 
-router.get("/", (req, res) => {
-  const row = db.prepare("SELECT value FROM settings WHERE key = 'closingTime'").get();
-  res.json({ ok: true, closingTime: row ? row.value : DEFAULT_CLOSING_TIME });
+router.get("/", async (req, res) => {
+  const doc = await settingsCol.doc("closingTime").get();
+  res.json({ ok: true, closingTime: doc.exists ? doc.data().value : DEFAULT_CLOSING_TIME });
 });
 
-router.put("/", requireAdmin, (req, res) => {
+router.put("/", requireAdmin, async (req, res) => {
   const { closingTime } = req.body || {};
   if (!closingTime) return res.status(400).json({ error: "Missing closingTime." });
-  db.prepare(`INSERT INTO settings (key, value) VALUES ('closingTime', ?)
-              ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(closingTime);
+  await settingsCol.doc("closingTime").set({ value: closingTime });
   res.json({ ok: true });
 });
 
