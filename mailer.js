@@ -1,28 +1,5 @@
-const nodemailer = require("nodemailer");
-
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD,
-  },
-  connectionTimeout: 15000,
-});
-
-// Fails loudly at boot if the Gmail credentials are wrong, instead of
-// silently failing the first time a customer tries to sign up.
-transporter.verify((err) => {
-  if (err) {
-    console.error("[mailer] Gmail connection FAILED — check GMAIL_USER / GMAIL_APP_PASSWORD in your environment variables.");
-    console.error(err.message);
-  } else {
-    console.log("[mailer] Gmail connection OK — ready to send real emails.");
-  }
-});
-
 const FROM_NAME = process.env.MAIL_FROM_NAME || "Shadab Restaurant";
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
 
 async function sendOtpEmail(to, code, purpose) {
   const subject = purpose === "reset"
@@ -43,13 +20,28 @@ async function sendOtpEmail(to, code, purpose) {
     <p style="color:#666;font-size:14px;">This code expires in 10 minutes. If you didn't request this, you can ignore this email.</p>
   </div>`;
 
-  await transporter.sendMail({
-    from: `"${FROM_NAME}" <${process.env.GMAIL_USER}>`,
-    to,
-    subject,
-    html,
-    text: `Your verification code is ${code}. It expires in 10 minutes.`,
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      from: `${FROM_NAME} <onboarding@resend.dev>`,
+      to,
+      subject,
+      html,
+      text: `Your verification code is ${code}. It expires in 10 minutes.`,
+    }),
   });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("[mailer] Resend send FAILED:", errText);
+    throw new Error("Failed to send email");
+  }
+
+  console.log("[mailer] Email sent via Resend to", to);
 }
 
 module.exports = { sendOtpEmail };
