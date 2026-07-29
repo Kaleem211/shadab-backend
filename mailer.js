@@ -1,5 +1,6 @@
 const FROM_NAME = process.env.MAIL_FROM_NAME || "Shadab Restaurant";
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const FROM_EMAIL = process.env.GMAIL_USER;
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
 async function sendOtpEmail(to, code, purpose) {
   const subject = purpose === "reset"
@@ -20,28 +21,28 @@ async function sendOtpEmail(to, code, purpose) {
     <p style="color:#666;font-size:14px;">This code expires in 10 minutes. If you didn't request this, you can ignore this email.</p>
   </div>`;
 
-  const res = await fetch("https://api.resend.com/emails", {
+  const res = await fetch("https://api.brevo.com/v3/smtp/email", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${RESEND_API_KEY}`,
+      "api-key": BREVO_API_KEY,
       "Content-Type": "application/json",
+      "Accept": "application/json",
     },
     body: JSON.stringify({
-      from: `${FROM_NAME} <onboarding@resend.dev>`,
-      to,
+      sender: { name: FROM_NAME, email: FROM_EMAIL },
+      to: [{ email: to }],
       subject,
-      html,
-      text: `Your verification code is ${code}. It expires in 10 minutes.`,
+      htmlContent: html,
     }),
   });
 
   if (!res.ok) {
     const errText = await res.text();
-    console.error("[mailer] Resend send FAILED:", errText);
+    console.error("[mailer] Brevo send FAILED:", errText);
     throw new Error("Failed to send email");
   }
 
-  console.log("[mailer] Email sent via Resend to", to);
+  console.log("[mailer] Email sent via Brevo to", to);
 }
 
 module.exports = { sendOtpEmail };
