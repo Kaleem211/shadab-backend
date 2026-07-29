@@ -8,7 +8,7 @@ const ordersCol = db.collection("orders");
 
 router.post("/", requireAuth, async (req, res) => {
   try {
-    const { customerName, customerPhone, items, total } = req.body || {};
+    const { customerName, customerPhone, address, items, total } = req.body || {};
     if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: "Cart is empty." });
     if (typeof total !== "number") return res.status(400).json({ error: "Missing order total." });
 
@@ -18,6 +18,7 @@ router.post("/", requireAuth, async (req, res) => {
       userMobile: req.user.mobile,
       customerName: customerName || req.user.username,
       customerPhone: customerPhone || req.user.mobile,
+      address: address || "",
       items,
       total,
       status: "placed",
