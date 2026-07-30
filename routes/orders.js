@@ -18,10 +18,15 @@ const DEFAULT_CANCEL_WINDOW_MIN = 15;
    so nobody's food gets started until the kitchen has a worthwhile batch.
 
    Order status lifecycle: held -> confirmed -> preparing -> delivered
-   (or -> cancelled from held/confirmed/preparing). "confirmed" means the
-   pool minimum was met and the kitchen has accepted the order; "preparing"
-   is a separate, later stage the admin sets once the kitchen actually
-   starts cooking it. */
+   (or -> cancelled from held/confirmed — not from preparing, since the
+   kitchen has already started by then). "confirmed" means the pool
+   minimum is CURRENTLY met; that's re-evaluated continuously, so if
+   enough cancellations drag the day's total back under the minimum, any
+   order still sitting at "confirmed" (i.e. not yet "preparing") drops
+   back to "held" automatically. "preparing" is a separate, later stage
+   the admin sets once the kitchen actually starts cooking a specific
+   order — once there, it's locked in and pool changes no longer affect
+   it. */
 function istDateKey(d = new Date()) {
   const ist = new Date(d.getTime() + 5.5 * 60 * 60 * 1000);
   return ist.toISOString().slice(0, 10);
@@ -49,21 +54,25 @@ async function getSettings() {
   }
 }
 
-/* Self-healing pool recalculation. Rather than trusting an incrementally
-   maintained running total (which drifts whenever a cancellation, a
-   crashed request, or a concurrent write is missed), this recomputes the
-   day's pool total FROM THE ORDERS THEMSELVES every time it's called —
-   the orders collection is the single source of truth. It then:
-     1) Corrects the pool doc's `total` to match reality.
-     2) If the real total has reached the minimum and there are still
-        "held" orders sitting around (e.g. a race between two orders
-        landing at nearly the same moment, or the minimum being lowered
-        by the admin after some orders were placed), it sweeps them all
-        to "confirmed" right now instead of leaving them stuck.
-   This is safe to call as often as needed — on every order placed,
-   every cancellation, and defensively on every pool-status read — since
-   it never revives a cancelled order or un-confirms one that already
-   started cooking. */
+/* Self-healing pool recalculation — and the single source of truth for
+   every order's status. Rather than trusting an incrementally maintained
+   running total or a "once true, always true" met flag (which is what
+   caused orders to stay stuck showing "Confirmed" after a cancellation
+   dragged the day's real total back below the minimum), this recomputes
+   the day's pool total FROM THE ORDERS THEMSELVES every time it's
+   called, decides met/not-met fresh each time, and then moves orders
+   BOTH directions to match:
+     - met AND still "held"      -> sweep up to "confirmed"
+     - not met AND still "confirmed" (not yet "preparing")
+                                  -> sweep back down to "held"
+   Orders already "preparing" or "delivered" are never touched — once the
+   kitchen has actually started on a specific order, a later cancellation
+   elsewhere shouldn't erase that. Only orders still sitting at
+   "confirmed" (i.e. the kitchen hasn't started them yet) are eligible to
+   fall back to pending if the batch that justified confirming them no
+   longer holds up.
+   Safe to call as often as needed — on every order placed, every
+   cancellation, and defensively on every pool-status read. */
 async function reconcilePool(dateKey, minPoolOverride) {
   const minPool = typeof minPoolOverride === "number" ? minPoolOverride : (await getSettings()).minOrderPoolAmount;
   const snap = await ordersCol.where("dateKey", "==", dateKey).get();
@@ -89,23 +98,27 @@ async function reconcilePool(dateKey, minPoolOverride) {
         dateKey,
         total: activeTotal,
         minAmount: minPool,
-        met: !!(pool.met || met),
-        reachedAt: pool.reachedAt || (met ? new Date().toISOString() : null),
+        met,
+        // Purely informational — the moment the pool most recently
+        // crossed the line. Not used to decide anything, since met is
+        // now recomputed fresh every time rather than latched.
+        reachedAt: met ? (pool.met ? pool.reachedAt || new Date().toISOString() : new Date().toISOString()) : null,
       },
       { merge: true }
     );
   });
 
-  if (met) {
-    const stillHeld = activeOrders.filter((doc) => doc.data().status === "held");
-    if (stillHeld.length) {
-      const batch = db.batch();
-      stillHeld.forEach((doc) => batch.update(doc.ref, { status: "confirmed" }));
-      await batch.commit();
-    }
+  const toFlip = activeOrders.filter((doc) => {
+    const status = doc.data().status;
+    return met ? status === "held" : status === "confirmed";
+  });
+  if (toFlip.length) {
+    const batch = db.batch();
+    toFlip.forEach((doc) => batch.update(doc.ref, { status: met ? "confirmed" : "held" }));
+    await batch.commit();
   }
 
-  return { total: activeTotal, minAmount: minPool, met: met || false };
+  return { total: activeTotal, minAmount: minPool, met };
 }
 
 router.post("/", requireAuth, async (req, res) => {
@@ -117,8 +130,13 @@ router.post("/", requireAuth, async (req, res) => {
     const id = "ORD-" + Date.now().toString(36).toUpperCase() + crypto.randomBytes(2).toString("hex").toUpperCase();
     const dateKey = istDateKey();
     const settings = await getSettings();
-    const poolRef = poolsCol.doc(dateKey);
 
+    // Always written as "held" — reconcilePool (called right below) is the
+    // one and only place that decides whether it should actually be
+    // "confirmed", based on the real, current total of everyone's active
+    // orders for the day. That keeps order creation and cancellation
+    // using the exact same decision logic instead of two separate copies
+    // of the pool math that could drift apart.
     const order = {
       id,
       userMobile: req.user.mobile,
@@ -138,32 +156,7 @@ router.post("/", requireAuth, async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    await db.runTransaction(async (tx) => {
-      const poolSnap = await tx.get(poolRef);
-      const pool = poolSnap.exists ? poolSnap.data() : { total: 0, met: false, minAmount: settings.minOrderPoolAmount };
-      const newTotal = (pool.total || 0) + total;
-
-      if (pool.met || newTotal >= settings.minOrderPoolAmount) {
-        order.status = "confirmed";
-      }
-
-      tx.set(
-        poolRef,
-        {
-          dateKey,
-          total: newTotal,
-          minAmount: settings.minOrderPoolAmount,
-          met: pool.met || newTotal >= settings.minOrderPoolAmount,
-          reachedAt: !pool.met && newTotal >= settings.minOrderPoolAmount ? new Date().toISOString() : pool.reachedAt || null,
-        },
-        { merge: true }
-      );
-      tx.set(ordersCol.doc(id), order);
-    });
-
-    // Reconcile against the real orders collection right after writing —
-    // catches the case where this order's own write pushed the total over
-    // the line but a concurrent request's held order hasn't been swept yet.
+    await ordersCol.doc(id).set(order);
     await reconcilePool(dateKey, settings.minOrderPoolAmount);
     const freshDoc = await ordersCol.doc(id).get();
 
@@ -280,6 +273,9 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
     if (order.status === "cancelled") {
       return res.status(400).json({ error: "This order is already cancelled." });
     }
+    if (order.status === "preparing") {
+      return res.status(400).json({ error: "The kitchen has already started preparing this order — it can't be cancelled anymore." });
+    }
 
     const cancelWindowMinutes = Number.isFinite(Number(order.cancelWindowMinutes))
       ? Number(order.cancelWindowMinutes)
@@ -293,11 +289,13 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
     await ref.update({ status: "cancelled", cancelledAt: new Date().toISOString() });
 
     // Re-derive the day's pool total from the real (now one-fewer-active)
-    // set of orders — this is what keeps "held" orders correctly pending
-    // (or correctly confirmed) no matter how many other cancellations
-    // happen around them. "met" only ever moves forward: once the kitchen
-    // has committed to a batch, a later cancellation doesn't un-confirm
-    // orders that were already told they're on.
+    // set of orders. If that drags the total back below the minimum,
+    // reconcilePool will also flip any other still-"confirmed" (not yet
+    // "preparing") orders from today back to "held" — the batch that
+    // justified confirming them no longer holds up, so their status
+    // should honestly reflect that instead of staying stuck on
+    // "Confirmed". Orders already "preparing" or "delivered" are left
+    // alone since the kitchen has already committed to them specifically.
     if (order.dateKey) await reconcilePool(order.dateKey);
 
     res.json({ ok: true });
@@ -327,4 +325,4 @@ router.delete("/", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
-         
+     
