@@ -56,6 +56,33 @@ router.patch("/:id/deliver", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+/* Customer cancels their own order. Allowed any time before it's been
+   delivered — the front-end only shows the Cancel button while ordering
+   is still open (closing time + admin's extra/grace minutes) for the day,
+   but this endpoint enforces ownership + status regardless. */
+router.patch("/:id/cancel", requireAuth, async (req, res) => {
+  try {
+    const ref = ordersCol.doc(req.params.id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
+    const order = doc.data();
+    if (order.userMobile !== req.user.mobile) {
+      return res.status(403).json({ error: "You can only cancel your own orders." });
+    }
+    if (order.status === "delivered") {
+      return res.status(400).json({ error: "This order has already been delivered and can't be cancelled." });
+    }
+    if (order.status === "cancelled") {
+      return res.status(400).json({ error: "This order is already cancelled." });
+    }
+    await ref.update({ status: "cancelled", cancelledAt: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't cancel the order." });
+  }
+});
+
 router.delete("/", requireAdmin, async (req, res) => {
   const snap = await ordersCol.get();
   const batch = db.batch();
@@ -65,3 +92,4 @@ router.delete("/", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
+  
