@@ -172,15 +172,24 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "This order is already cancelled." });
     }
 
-    // If this order was still "held" (not yet pooled past the minimum),
-    // its value no longer counts toward today's pool total.
-    if (order.status === "held" && order.dateKey) {
+    // A cancelled order's value must never keep counting toward today's
+    // pool total — whether it was still "held" (not yet pooled past the
+    // minimum) OR already "confirmed" (pool already met). Previously only
+    // the "held" case was handled, so cancelling a CONFIRMED order left
+    // its amount stuck in the pool total forever — e.g. a ₹920 order that
+    // crossed the ₹600 minimum, then got cancelled, would still show
+    // "₹920 of ₹600 reached" to the admin even though nothing real was
+    // left backing that total. We now always subtract the cancelled
+    // order's amount from the day's pool total. Note: "met" intentionally
+    // stays true once reached (other orders already got the "confirmed"
+    // treatment on the strength of that batch), so the kitchen commitment
+    // isn't reversed — only the displayed total is corrected.
+    if ((order.status === "held" || order.status === "confirmed") && order.dateKey) {
       const poolRef = poolsCol.doc(order.dateKey);
       await db.runTransaction(async (tx) => {
         const poolSnap = await tx.get(poolRef);
         if (!poolSnap.exists) return;
         const pool = poolSnap.data();
-        if (pool.met) return; // threshold already crossed for the day, leave it be
         tx.update(poolRef, { total: Math.max(0, (pool.total || 0) - order.total) });
       });
     }
@@ -193,13 +202,23 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
   }
 });
 
+/* Clears every order AND every day's pool record. The pool banner
+   ("₹970 of ₹600 reached") lives in a separate `pools` collection keyed
+   by calendar date — wiping only `orders` left that collection untouched,
+   so the banner kept showing stale totals forever after a clear, no
+   matter what today's date was. Deleting every doc in `pools` (not just
+   today's) means the very next order placed — on any date — starts the
+   count fresh from ₹0. */
 router.delete("/", requireAdmin, async (req, res) => {
   const snap = await ordersCol.get();
   const batch = db.batch();
   snap.forEach((doc) => batch.delete(doc.ref));
+
+  const poolsSnap = await poolsCol.get();
+  poolsSnap.forEach((doc) => batch.delete(doc.ref));
+
   await batch.commit();
   res.json({ ok: true });
 });
 
 module.exports = router;
-  
