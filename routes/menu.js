@@ -3,33 +3,58 @@ const db = require("../db");
 const { requireAdmin } = require("../utils/auth");
 
 const router = express.Router();
+const menuCol = db.collection("menuOverrides");
 
 /* Public: get all menu overrides (edited/added items) */
-router.get("/", (req, res) => {
-  const rows = db.prepare("SELECT * FROM menu_overrides").all();
-  res.json({ ok: true, items: rows.map((r) => JSON.parse(r.data_json)) });
+router.get("/", async (req, res) => {
+  try {
+    const snap = await menuCol.get();
+    const items = [];
+    snap.forEach((doc) => items.push(doc.data()));
+    res.json({ ok: true, items });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't load menu overrides." });
+  }
 });
 
 /* Admin: upsert one item (add or edit) */
-router.put("/:id", requireAdmin, (req, res) => {
-  const id = req.params.id;
-  const data = { ...req.body, id };
-  db.prepare(`INSERT INTO menu_overrides (id, data_json) VALUES (?, ?)
-              ON CONFLICT(id) DO UPDATE SET data_json = excluded.data_json`)
-    .run(id, JSON.stringify(data));
-  res.json({ ok: true, item: data });
+router.put("/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const data = { ...req.body, id };
+    await menuCol.doc(id).set(data);
+    res.json({ ok: true, item: data });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't save the menu item." });
+  }
 });
 
 /* Admin: delete/restore one item override */
-router.delete("/:id", requireAdmin, (req, res) => {
-  db.prepare("DELETE FROM menu_overrides WHERE id = ?").run(req.params.id);
-  res.json({ ok: true });
+router.delete("/:id", requireAdmin, async (req, res) => {
+  try {
+    await menuCol.doc(req.params.id).delete();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't delete the menu item." });
+  }
 });
 
 /* Admin: restore original menu (wipe all overrides) */
-router.delete("/", requireAdmin, (req, res) => {
-  db.prepare("DELETE FROM menu_overrides").run();
-  res.json({ ok: true });
+router.delete("/", requireAdmin, async (req, res) => {
+  try {
+    const snap = await menuCol.get();
+    const batch = db.batch();
+    snap.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't restore the menu." });
+  }
 });
 
 module.exports = router;
+                                        
