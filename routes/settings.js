@@ -20,6 +20,9 @@ const DEFAULTS = {
   contacts: [
     { id: "shareef", name: "Shareef", phone: "+91 63009 47969", details: "" },
   ],
+  // Orders are held as "pending" until the combined value of everyone's
+  // orders for the day reaches this amount — then they all confirm at once.
+  minOrderPoolAmount: 600,
 };
 
 const ALLOWED_KEYS = [
@@ -29,6 +32,7 @@ const ALLOWED_KEYS = [
   "deliveryWindowEnd",
   "whatsappGroupLink",
   "contacts",
+  "minOrderPoolAmount",
 ];
 
 /* Public: every customer's browser calls this on load so everyone always
@@ -74,6 +78,13 @@ router.put("/", requireAdmin, async (req, res) => {
     }
     if (updates.contacts !== undefined && !Array.isArray(updates.contacts)) {
       return res.status(400).json({ error: "contacts must be an array." });
+    }
+    if (updates.minOrderPoolAmount !== undefined) {
+      const n = Number(updates.minOrderPoolAmount);
+      if (!Number.isFinite(n) || n < 0) {
+        return res.status(400).json({ error: "minOrderPoolAmount must be a positive number." });
+      }
+      updates.minOrderPoolAmount = n;
     }
 
     await settingsDoc.set(updates, { merge: true });
