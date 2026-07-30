@@ -23,6 +23,11 @@ const DEFAULTS = {
   // Orders are held as "pending" until the combined value of everyone's
   // orders for the day reaches this amount — then they all confirm at once.
   minOrderPoolAmount: 600,
+  // How long (in minutes) after placing an order a customer is still
+  // allowed to cancel it themselves. Independent of the ordering cut-off —
+  // this is a per-order countdown that starts at that order's createdAt,
+  // not tied to the restaurant's closing time.
+  cancelWindowMinutes: 15,
 };
 
 const ALLOWED_KEYS = [
@@ -33,6 +38,7 @@ const ALLOWED_KEYS = [
   "whatsappGroupLink",
   "contacts",
   "minOrderPoolAmount",
+  "cancelWindowMinutes",
 ];
 
 /* Public: every customer's browser calls this on load so everyone always
@@ -86,6 +92,13 @@ router.put("/", requireAdmin, async (req, res) => {
       }
       updates.minOrderPoolAmount = n;
     }
+    if (updates.cancelWindowMinutes !== undefined) {
+      const n = Number(updates.cancelWindowMinutes);
+      if (!Number.isFinite(n) || n < 0 || n > 1440) {
+        return res.status(400).json({ error: "cancelWindowMinutes must be a number between 0 and 1440." });
+      }
+      updates.cancelWindowMinutes = n;
+    }
 
     await settingsDoc.set(updates, { merge: true });
     const doc = await settingsDoc.get();
@@ -103,4 +116,5 @@ router.post("/admin-password", requireAdmin, (req, res) => {
 });
 
 module.exports = router;
-              
+
+         
