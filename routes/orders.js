@@ -67,20 +67,23 @@ async function getSettings() {
   }
 }
 
-/* Cancellation used to be a per-order countdown timed from when THAT
-   order was placed. It's now a single shared clock deadline for the
-   whole day: closing time + extra/grace time + the admin's cancellation
-   allowance, all added together. E.g. closing 7:30 PM + 3 min grace +
-   10 min cancellation allowance = every order placed that day can be
-   cancelled up until 7:43 PM, full stop — not "10 minutes after I
-   personally placed it".
-   closingTime/graceMinutes/cancelWindowMinutes are snapshotted onto each
-   order at creation time (see POST /) so a later settings change doesn't
-   retroactively move the goalposts for an order already placed. */
-/* Two admin-selectable ways to decide the cancellation deadline, both
-   snapshotted onto the order at creation time so a later settings change
-   never retroactively moves an in-flight order's window:
+/* Cancellation is a single shared clock deadline for the whole day:
+   closing time + extra/grace time + the admin's cancellation allowance,
+   all added together. E.g. closing 7:30 PM + 3 min grace + 10 min
+   cancellation allowance = every order placed that day can be cancelled
+   up until 7:43 PM, full stop — not "10 minutes after I personally
+   placed it".
 
+   This is always computed from the CURRENT live settings (not a value
+   frozen on the order at creation time) — if the admin changes the
+   closing time (or grace/allowance/mode) mid-day, every still-open
+   order's cancellation deadline moves with it immediately, both for the
+   customer-facing countdown/terms text and for this endpoint's own
+   enforcement. The closingTime/graceMinutes/etc fields still stored on
+   each order are kept only as a historical record of what was in effect
+   when it was placed — they are no longer used to compute the deadline.
+
+   Two admin-selectable ways to decide the cancellation deadline:
    - "afterClosing" (default): a single shared clock deadline for the
      whole day — closing time + grace + the admin's cancellation
      allowance. Open from the moment the order is placed.
@@ -89,23 +92,24 @@ async function getSettings() {
      closing time. Orders placed before the window opens must wait;
      once it closes, cancellation is locked out for the rest of the day.
 
-   dateKey is an IST calendar date ("YYYY-MM-DD"); the various *Time
-   fields are IST clock times ("HH:MM"). Combining them with an explicit
-   +05:30 offset gives an unambiguous instant regardless of the server's
-   own timezone. */
-function getCancelWindow(order) {
+   dateKey is an IST calendar date ("YYYY-MM-DD"), taken from the order
+   itself (so the window still applies to the day the order was actually
+   placed on); the various *Time fields are IST clock times ("HH:MM")
+   read live from settings. Combining them with an explicit +05:30 offset
+   gives an unambiguous instant regardless of the server's own timezone. */
+function getCancelWindow(order, settings) {
   const dateKey = order.dateKey || istDateKey();
   const toMs = (hhmm) => new Date(`${dateKey}T${hhmm}:00+05:30`).getTime();
 
-  if (order.cancellationMode === "timeRange") {
-    const start = order.cancelWindowStart || "18:00";
-    const end = order.cancelWindowEnd || "19:00";
+  if (settings.cancellationMode === "timeRange") {
+    const start = settings.cancelWindowStart || "18:00";
+    const end = settings.cancelWindowEnd || "19:00";
     return { mode: "timeRange", opensAtMs: toMs(start), closesAtMs: toMs(end) };
   }
 
-  const closingTime = order.closingTime || DEFAULT_CLOSING_TIME;
-  const graceMinutes = Number.isFinite(Number(order.graceMinutes)) ? Number(order.graceMinutes) : DEFAULT_GRACE_MIN;
-  const cancelWindowMinutes = Number.isFinite(Number(order.cancelWindowMinutes)) ? Number(order.cancelWindowMinutes) : DEFAULT_CANCEL_WINDOW_MIN;
+  const closingTime = settings.closingTime || DEFAULT_CLOSING_TIME;
+  const graceMinutes = Number.isFinite(Number(settings.graceMinutes)) ? Number(settings.graceMinutes) : DEFAULT_GRACE_MIN;
+  const cancelWindowMinutes = Number.isFinite(Number(settings.cancelWindowMinutes)) ? Number(settings.cancelWindowMinutes) : DEFAULT_CANCEL_WINDOW_MIN;
   const closingMs = toMs(closingTime);
   return {
     mode: "afterClosing",
@@ -321,12 +325,13 @@ router.patch("/:id/deliver", requireAdmin, async (req, res) => {
 });
 
 /* Customer cancels their own order. Allowed until the shared daily
-   deadline computed by getCancelWindow() — either closing time + extra
-   time + the admin's cancellation allowance, or a fixed daily time
-   range, depending on the admin's chosen mode — not a per-order
-   countdown from when it was placed. The
-   front-end hides the Cancel button once that deadline passes, but this
-   endpoint enforces it regardless of what the client sends. */
+   deadline computed by getCancelWindow() from the CURRENT live settings
+   — either closing time + extra time + the admin's cancellation
+   allowance, or a fixed daily time range, depending on the admin's
+   chosen mode — not a per-order countdown from when it was placed, and
+   not a value frozen from when the order was placed. The front-end
+   hides the Cancel button once that deadline passes, but this endpoint
+   enforces it regardless of what the client sends. */
 router.patch("/:id/cancel", requireAuth, async (req, res) => {
   try {
     const ref = ordersCol.doc(req.params.id);
@@ -346,7 +351,8 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "The kitchen has already started preparing this order — it can't be cancelled anymore." });
     }
 
-    const window = getCancelWindow(order);
+    const settings = await getSettings();
+    const window = getCancelWindow(order, settings);
     const now = Date.now();
     const fmt = (ms) => new Date(ms).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" });
     if (window.opensAtMs && now < window.opensAtMs) {
@@ -395,3 +401,4 @@ router.delete("/", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
+         
