@@ -48,6 +48,9 @@ async function getSettings() {
       deliveryWindowEnd: data.deliveryWindowEnd || "20:45",
       closingTime: data.closingTime || DEFAULT_CLOSING_TIME,
       graceMinutes: Number.isFinite(graceN) && graceN >= 0 ? graceN : DEFAULT_GRACE_MIN,
+      cancellationMode: data.cancellationMode === "timeRange" ? "timeRange" : "afterClosing",
+      cancelWindowStart: data.cancelWindowStart || "18:00",
+      cancelWindowEnd: data.cancelWindowEnd || "19:00",
     };
   } catch {
     return {
@@ -57,6 +60,9 @@ async function getSettings() {
       deliveryWindowEnd: "20:45",
       closingTime: DEFAULT_CLOSING_TIME,
       graceMinutes: DEFAULT_GRACE_MIN,
+      cancellationMode: "afterClosing",
+      cancelWindowStart: "18:00",
+      cancelWindowEnd: "19:00",
     };
   }
 }
@@ -71,16 +77,41 @@ async function getSettings() {
    closingTime/graceMinutes/cancelWindowMinutes are snapshotted onto each
    order at creation time (see POST /) so a later settings change doesn't
    retroactively move the goalposts for an order already placed. */
-function cancelCutoffMs(order) {
+/* Two admin-selectable ways to decide the cancellation deadline, both
+   snapshotted onto the order at creation time so a later settings change
+   never retroactively moves an in-flight order's window:
+
+   - "afterClosing" (default): a single shared clock deadline for the
+     whole day — closing time + grace + the admin's cancellation
+     allowance. Open from the moment the order is placed.
+   - "timeRange": cancellation is only allowed inside a fixed daily
+     clock-time window (e.g. 6:00 PM – 7:00 PM), independent of the
+     closing time. Orders placed before the window opens must wait;
+     once it closes, cancellation is locked out for the rest of the day.
+
+   dateKey is an IST calendar date ("YYYY-MM-DD"); the various *Time
+   fields are IST clock times ("HH:MM"). Combining them with an explicit
+   +05:30 offset gives an unambiguous instant regardless of the server's
+   own timezone. */
+function getCancelWindow(order) {
+  const dateKey = order.dateKey || istDateKey();
+  const toMs = (hhmm) => new Date(`${dateKey}T${hhmm}:00+05:30`).getTime();
+
+  if (order.cancellationMode === "timeRange") {
+    const start = order.cancelWindowStart || "18:00";
+    const end = order.cancelWindowEnd || "19:00";
+    return { mode: "timeRange", opensAtMs: toMs(start), closesAtMs: toMs(end) };
+  }
+
   const closingTime = order.closingTime || DEFAULT_CLOSING_TIME;
   const graceMinutes = Number.isFinite(Number(order.graceMinutes)) ? Number(order.graceMinutes) : DEFAULT_GRACE_MIN;
   const cancelWindowMinutes = Number.isFinite(Number(order.cancelWindowMinutes)) ? Number(order.cancelWindowMinutes) : DEFAULT_CANCEL_WINDOW_MIN;
-  const dateKey = order.dateKey || istDateKey();
-  // dateKey is an IST calendar date ("YYYY-MM-DD"); closingTime is an IST
-  // clock time ("HH:MM"). Combining them with an explicit +05:30 offset
-  // gives an unambiguous instant regardless of the server's own timezone.
-  const closingMs = new Date(`${dateKey}T${closingTime}:00+05:30`).getTime();
-  return closingMs + (graceMinutes + cancelWindowMinutes) * 60 * 1000;
+  const closingMs = toMs(closingTime);
+  return {
+    mode: "afterClosing",
+    opensAtMs: null, // open from the moment the order is placed
+    closesAtMs: closingMs + (graceMinutes + cancelWindowMinutes) * 60 * 1000,
+  };
 }
 
 /* Self-healing pool recalculation — and the single source of truth for
@@ -185,6 +216,9 @@ router.post("/", requireAuth, async (req, res) => {
       closingTime: settings.closingTime,
       graceMinutes: settings.graceMinutes,
       cancelWindowMinutes: settings.cancelWindowMinutes,
+      cancellationMode: settings.cancellationMode,
+      cancelWindowStart: settings.cancelWindowStart,
+      cancelWindowEnd: settings.cancelWindowEnd,
       createdAt: new Date().toISOString(),
     };
 
@@ -287,8 +321,10 @@ router.patch("/:id/deliver", requireAdmin, async (req, res) => {
 });
 
 /* Customer cancels their own order. Allowed until the shared daily
-   deadline computed by cancelCutoffMs() — closing time + extra time +
-   the admin's cancellation allowance — not a per-order countdown. The
+   deadline computed by getCancelWindow() — either closing time + extra
+   time + the admin's cancellation allowance, or a fixed daily time
+   range, depending on the admin's chosen mode — not a per-order
+   countdown from when it was placed. The
    front-end hides the Cancel button once that deadline passes, but this
    endpoint enforces it regardless of what the client sends. */
 router.patch("/:id/cancel", requireAuth, async (req, res) => {
@@ -310,10 +346,14 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "The kitchen has already started preparing this order — it can't be cancelled anymore." });
     }
 
-    const cutoffMs = cancelCutoffMs(order);
-    if (Date.now() > cutoffMs) {
-      const cutoffLabel = new Date(cutoffMs).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" });
-      return res.status(400).json({ error: `The cancellation window for today's orders closed at ${cutoffLabel}.` });
+    const window = getCancelWindow(order);
+    const now = Date.now();
+    const fmt = (ms) => new Date(ms).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" });
+    if (window.opensAtMs && now < window.opensAtMs) {
+      return res.status(400).json({ error: `Cancellation opens at ${fmt(window.opensAtMs)} for today's orders.` });
+    }
+    if (now > window.closesAtMs) {
+      return res.status(400).json({ error: `The cancellation window for today's orders closed at ${fmt(window.closesAtMs)}.` });
     }
 
     await ref.update({ status: "cancelled", cancelledAt: new Date().toISOString() });
@@ -355,4 +395,3 @@ router.delete("/", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
-     
