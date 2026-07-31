@@ -152,10 +152,17 @@ async function reconcilePool(dateKey, minPoolOverride) {
 
   const met = activeTotal >= minPool;
   const poolRef = poolsCol.doc(dateKey);
+  let deliveryArrivedAt = null;
 
   await db.runTransaction(async (tx) => {
     const poolSnap = await tx.get(poolRef);
     const pool = poolSnap.exists ? poolSnap.data() : {};
+    // deliveryArrivedAt is only ever set by the admin's "mark delivery
+    // arrived" broadcast (see /deliver-today below) — merge:true here
+    // means we never touch it while just reconciling totals, so it
+    // naturally carries forward for the rest of that day and just as
+    // naturally starts unset on a fresh day's pool doc.
+    deliveryArrivedAt = pool.deliveryArrivedAt || null;
     tx.set(
       poolRef,
       {
@@ -182,7 +189,7 @@ async function reconcilePool(dateKey, minPoolOverride) {
     await batch.commit();
   }
 
-  return { total: activeTotal, minAmount: minPool, met };
+  return { total: activeTotal, minAmount: minPool, met, deliveryArrivedAt };
 }
 
 router.post("/", requireAuth, async (req, res) => {
@@ -253,6 +260,7 @@ router.get("/pool-status", async (req, res) => {
       total: pool.total,
       met: pool.met,
       remaining: Math.max(0, pool.minAmount - pool.total),
+      deliveryArrivedAt: pool.deliveryArrivedAt || null,
     });
   } catch (err) {
     console.error(err);
@@ -324,6 +332,44 @@ router.patch("/:id/deliver", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+/* Admin's single "Delivery arrived" broadcast for the day. Rather than
+   the admin clicking "deliver" on every order one at a time, this moves
+   EVERY of today's still-open orders (status "confirmed" or "preparing"
+   — "held" orders never reached the kitchen, so they're left alone) to
+   "delivered" in one batch, and stamps today's pool doc with
+   deliveryArrivedAt so every customer's live poll (GET /pool-status,
+   already running every few seconds) picks it up and shows a
+   below-header "delivery has arrived" notification — without needing a
+   push-notification service. Matches the front-end's rule that the last
+   8-10% of an order's progress bar only closes once the admin explicitly
+   confirms the order has reached the customer; this is that
+   confirmation, applied to the whole day's batch at once. */
+router.post("/deliver-today", requireAdmin, async (req, res) => {
+  try {
+    const dateKey = istDateKey();
+    const snap = await ordersCol.where("dateKey", "==", dateKey).get();
+    const toDeliver = [];
+    snap.forEach((doc) => {
+      const status = doc.data().status;
+      if (status === "confirmed" || status === "preparing") toDeliver.push(doc);
+    });
+
+    const now = new Date().toISOString();
+    if (toDeliver.length) {
+      const batch = db.batch();
+      toDeliver.forEach((doc) => batch.update(doc.ref, { status: "delivered", deliveredAt: now }));
+      await batch.commit();
+    }
+
+    await poolsCol.doc(dateKey).set({ dateKey, deliveryArrivedAt: now }, { merge: true });
+
+    res.json({ ok: true, deliveredCount: toDeliver.length, deliveryArrivedAt: now });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't mark today's delivery as arrived." });
+  }
+});
+
 /* Customer cancels their own order. Allowed until the shared daily
    deadline computed by getCancelWindow() from the CURRENT live settings
    — either closing time + extra time + the admin's cancellation
@@ -380,7 +426,6 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Couldn't cancel the order." });
   }
 });
-
 /* Clears every order AND every day's pool record. The pool banner
    ("₹970 of ₹600 reached") lives in a separate `pools` collection keyed
    by calendar date — wiping only `orders` left that collection untouched,
@@ -401,4 +446,4 @@ router.delete("/", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
-         
+              
