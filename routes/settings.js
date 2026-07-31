@@ -27,8 +27,16 @@ const DEFAULTS = {
   // graceMinutes) a customer is still allowed to cancel an order. Shared
   // by every order placed that day — e.g. closing 19:15 + 3 min grace +
   // 15 here means all of today's orders can be cancelled up until 19:33.
-  // See orders.js's cancelCutoffMs() for the actual computation.
+  // Only used when cancellationMode is "afterClosing". See orders.js's
+  // getCancelWindow() for the actual computation.
   cancelWindowMinutes: 15,
+  // Which method decides the cancellation deadline:
+  //  - "afterClosing": cancelWindowMinutes past (closingTime + graceMinutes)
+  //  - "timeRange": a fixed clock-time window (cancelWindowStart to
+  //    cancelWindowEnd) each day, independent of closing time
+  cancellationMode: "afterClosing",
+  cancelWindowStart: "18:00",  // 6:00 PM — only used when cancellationMode is "timeRange"
+  cancelWindowEnd: "19:00",    // 7:00 PM — only used when cancellationMode is "timeRange"
 };
 
 const ALLOWED_KEYS = [
@@ -40,6 +48,9 @@ const ALLOWED_KEYS = [
   "contacts",
   "minOrderPoolAmount",
   "cancelWindowMinutes",
+  "cancellationMode",
+  "cancelWindowStart",
+  "cancelWindowEnd",
 ];
 
 /* Public: every customer's browser calls this on load so everyone always
@@ -100,6 +111,26 @@ router.put("/", requireAdmin, async (req, res) => {
       }
       updates.cancelWindowMinutes = n;
     }
+    if (updates.cancellationMode !== undefined && !["afterClosing", "timeRange"].includes(updates.cancellationMode)) {
+      return res.status(400).json({ error: "cancellationMode must be 'afterClosing' or 'timeRange'." });
+    }
+    if (updates.cancelWindowStart && !/^\d{2}:\d{2}$/.test(updates.cancelWindowStart)) {
+      return res.status(400).json({ error: "cancelWindowStart must be in HH:MM format." });
+    }
+    if (updates.cancelWindowEnd && !/^\d{2}:\d{2}$/.test(updates.cancelWindowEnd)) {
+      return res.status(400).json({ error: "cancelWindowEnd must be in HH:MM format." });
+    }
+    // Guard against an inverted range only when both ends are present in
+    // this update, or already present in the saved doc — so a partial
+    // update to just one side doesn't false-positive against a stale value.
+    {
+      const existing = (await settingsDoc.get()).data() || {};
+      const start = updates.cancelWindowStart || existing.cancelWindowStart || DEFAULTS.cancelWindowStart;
+      const end = updates.cancelWindowEnd || existing.cancelWindowEnd || DEFAULTS.cancelWindowEnd;
+      if ((updates.cancelWindowStart || updates.cancelWindowEnd) && start >= end) {
+        return res.status(400).json({ error: "Cancellation window end time must be after the start time." });
+      }
+    }
 
     await settingsDoc.set(updates, { merge: true });
     const doc = await settingsDoc.get();
@@ -118,4 +149,4 @@ router.post("/admin-password", requireAdmin, (req, res) => {
 
 module.exports = router;
 
-   
+         
