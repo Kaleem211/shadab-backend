@@ -23,10 +23,11 @@ const DEFAULTS = {
   // Orders are held as "pending" until the combined value of everyone's
   // orders for the day reaches this amount — then they all confirm at once.
   minOrderPoolAmount: 600,
-  // How long (in minutes) after placing an order a customer is still
-  // allowed to cancel it themselves. Independent of the ordering cut-off —
-  // this is a per-order countdown that starts at that order's createdAt,
-  // not tied to the restaurant's closing time.
+  // How many extra minutes past the daily cutoff (closingTime +
+  // graceMinutes) a customer is still allowed to cancel an order. Shared
+  // by every order placed that day — e.g. closing 19:15 + 3 min grace +
+  // 15 here means all of today's orders can be cancelled up until 19:33.
+  // See orders.js's cancelCutoffMs() for the actual computation.
   cancelWindowMinutes: 15,
 };
 
@@ -117,4 +118,4 @@ router.post("/admin-password", requireAdmin, (req, res) => {
 
 module.exports = router;
 
-       
+   
