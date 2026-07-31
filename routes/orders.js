@@ -137,8 +137,9 @@ function getCancelWindow(order, settings) {
    longer holds up.
    Safe to call as often as needed — on every order placed, every
    cancellation, and defensively on every pool-status read. */
-async function reconcilePool(dateKey, minPoolOverride) {
-  const minPool = typeof minPoolOverride === "number" ? minPoolOverride : (await getSettings()).minOrderPoolAmount;
+async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
+  const settings = settingsOverride || (await getSettings());
+  const minPool = typeof minPoolOverride === "number" ? minPoolOverride : settings.minOrderPoolAmount;
   const snap = await ordersCol.where("dateKey", "==", dateKey).get();
   const activeOrders = [];
   let activeTotal = 0;
@@ -189,6 +190,29 @@ async function reconcilePool(dateKey, minPoolOverride) {
     await batch.commit();
   }
 
+  // Auto-promote "confirmed" -> "preparing" the moment an order's own
+  // cancellation window has closed, instead of waiting on the admin to flip
+  // it by hand. This is what makes the customer-facing progress tracker
+  // actually reach the "Preparing" stage on its own — previously an order
+  // could sit at "confirmed" forever until someone in the admin panel
+  // manually changed its status, even though cancellation was long over.
+  // Orders that were just swept held->confirmed above haven't had a chance
+  // to open a cancel window yet, so they're naturally excluded (their
+  // in-memory status here is still "held").
+  const now = Date.now();
+  const toPromote = activeOrders.filter((doc) => {
+    const o = doc.data();
+    if (o.status !== "confirmed") return false;
+    const window = getCancelWindow(o, settings);
+    return now > window.closesAtMs;
+  });
+  if (toPromote.length) {
+    const nowIso = new Date(now).toISOString();
+    const batch = db.batch();
+    toPromote.forEach((doc) => batch.update(doc.ref, { status: "preparing", preparingAt: nowIso }));
+    await batch.commit();
+  }
+
   return { total: activeTotal, minAmount: minPool, met, deliveryArrivedAt };
 }
 
@@ -234,7 +258,7 @@ router.post("/", requireAuth, async (req, res) => {
     };
 
     await ordersCol.doc(id).set(order);
-    await reconcilePool(dateKey, settings.minOrderPoolAmount);
+    await reconcilePool(dateKey, settings.minOrderPoolAmount, settings);
     const freshDoc = await ordersCol.doc(id).get();
 
     res.json({ ok: true, order: freshDoc.exists ? freshDoc.data() : order });
@@ -252,7 +276,7 @@ router.get("/pool-status", async (req, res) => {
   try {
     const dateKey = istDateKey();
     const settings = await getSettings();
-    const pool = await reconcilePool(dateKey, settings.minOrderPoolAmount);
+    const pool = await reconcilePool(dateKey, settings.minOrderPoolAmount, settings);
     res.json({
       ok: true,
       dateKey,
@@ -355,18 +379,75 @@ router.post("/deliver-today", requireAdmin, async (req, res) => {
     });
 
     const now = new Date().toISOString();
+    // Remember exactly what this broadcast touched (which orders, and what
+    // each one's status was right before) so a single "Undo" can cleanly
+    // reverse it later — see /deliver-today/undo below. previousStatuses is
+    // keyed by order id rather than assumed to be uniform, since a mixed
+    // batch of "confirmed" and "preparing" orders is normal.
+    const previousStatuses = {};
+    toDeliver.forEach((doc) => { previousStatuses[doc.id] = doc.data().status; });
+
     if (toDeliver.length) {
       const batch = db.batch();
       toDeliver.forEach((doc) => batch.update(doc.ref, { status: "delivered", deliveredAt: now }));
       await batch.commit();
     }
 
-    await poolsCol.doc(dateKey).set({ dateKey, deliveryArrivedAt: now }, { merge: true });
+    await poolsCol.doc(dateKey).set(
+      {
+        dateKey,
+        deliveryArrivedAt: now,
+        lastDeliveryBroadcast: { at: now, orderIds: toDeliver.map((d) => d.id), previousStatuses },
+      },
+      { merge: true }
+    );
 
     res.json({ ok: true, deliveredCount: toDeliver.length, deliveryArrivedAt: now });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Couldn't mark today's delivery as arrived." });
+  }
+});
+
+/* Reverses the most recent /deliver-today broadcast for the current day —
+   the admin dashboard's "Undo" action. Only reverts orders that are still
+   exactly as that broadcast left them (status "delivered" with a matching
+   deliveredAt timestamp); an order a customer or admin touched separately
+   since then is left alone rather than silently rewound. Available until
+   the admin broadcasts delivery again or a new day's pool doc starts fresh
+   with no lastDeliveryBroadcast recorded. */
+router.post("/deliver-today/undo", requireAdmin, async (req, res) => {
+  try {
+    const dateKey = istDateKey();
+    const poolRef = poolsCol.doc(dateKey);
+    const poolSnap = await poolRef.get();
+    const pool = poolSnap.exists ? poolSnap.data() : {};
+    const broadcast = pool.lastDeliveryBroadcast;
+    if (!broadcast || !Array.isArray(broadcast.orderIds) || !broadcast.orderIds.length) {
+      return res.status(400).json({ error: "There's nothing to undo." });
+    }
+const docs = await Promise.all(broadcast.orderIds.map((id) => ordersCol.doc(id).get()));
+    const toRevert = docs.filter((doc) => {
+      if (!doc.exists) return false;
+      const o = doc.data();
+      return o.status === "delivered" && o.deliveredAt === broadcast.at;
+    });
+
+    if (toRevert.length) {
+      const batch = db.batch();
+      toRevert.forEach((doc) => {
+        const restoredStatus = broadcast.previousStatuses[doc.id] || "confirmed";
+        batch.update(doc.ref, { status: restoredStatus, deliveredAt: null });
+      });
+      await batch.commit();
+    }
+
+    await poolRef.set({ dateKey, deliveryArrivedAt: null, lastDeliveryBroadcast: null }, { merge: true });
+
+    res.json({ ok: true, revertedCount: toRevert.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't undo today's delivery broadcast." });
   }
 });
 
@@ -418,7 +499,7 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
     // should honestly reflect that instead of staying stuck on
     // "Confirmed". Orders already "preparing" or "delivered" are left
     // alone since the kitchen has already committed to them specifically.
-    if (order.dateKey) await reconcilePool(order.dateKey);
+    if (order.dateKey) await reconcilePool(order.dateKey, undefined, settings);
 
     res.json({ ok: true });
   } catch (err) {
@@ -426,6 +507,7 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Couldn't cancel the order." });
   }
 });
+
 /* Clears every order AND every day's pool record. The pool banner
    ("₹970 of ₹600 reached") lives in a separate `pools` collection keyed
    by calendar date — wiping only `orders` left that collection untouched,
@@ -446,4 +528,4 @@ router.delete("/", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
-              
+   
