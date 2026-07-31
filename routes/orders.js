@@ -9,6 +9,8 @@ const poolsCol = db.collection("pools");
 const settingsDoc = db.collection("settings").doc("config");
 const DEFAULT_MIN_POOL = 600;
 const DEFAULT_CANCEL_WINDOW_MIN = 15;
+const DEFAULT_CLOSING_TIME = "19:15";
+const DEFAULT_GRACE_MIN = 3;
 
 /* All orders for a calendar day (IST, since that's the restaurant's
    timezone) pool together. Orders sit as status "held" — shown to the
@@ -38,11 +40,14 @@ async function getSettings() {
     const data = doc.exists ? doc.data() : {};
     const minN = Number(data.minOrderPoolAmount);
     const cancelN = Number(data.cancelWindowMinutes);
+    const graceN = Number(data.graceMinutes);
     return {
       minOrderPoolAmount: Number.isFinite(minN) && minN >= 0 ? minN : DEFAULT_MIN_POOL,
       cancelWindowMinutes: Number.isFinite(cancelN) && cancelN >= 0 ? cancelN : DEFAULT_CANCEL_WINDOW_MIN,
       deliveryWindowStart: data.deliveryWindowStart || "20:30",
       deliveryWindowEnd: data.deliveryWindowEnd || "20:45",
+      closingTime: data.closingTime || DEFAULT_CLOSING_TIME,
+      graceMinutes: Number.isFinite(graceN) && graceN >= 0 ? graceN : DEFAULT_GRACE_MIN,
     };
   } catch {
     return {
@@ -50,8 +55,32 @@ async function getSettings() {
       cancelWindowMinutes: DEFAULT_CANCEL_WINDOW_MIN,
       deliveryWindowStart: "20:30",
       deliveryWindowEnd: "20:45",
+      closingTime: DEFAULT_CLOSING_TIME,
+      graceMinutes: DEFAULT_GRACE_MIN,
     };
   }
+}
+
+/* Cancellation used to be a per-order countdown timed from when THAT
+   order was placed. It's now a single shared clock deadline for the
+   whole day: closing time + extra/grace time + the admin's cancellation
+   allowance, all added together. E.g. closing 7:30 PM + 3 min grace +
+   10 min cancellation allowance = every order placed that day can be
+   cancelled up until 7:43 PM, full stop — not "10 minutes after I
+   personally placed it".
+   closingTime/graceMinutes/cancelWindowMinutes are snapshotted onto each
+   order at creation time (see POST /) so a later settings change doesn't
+   retroactively move the goalposts for an order already placed. */
+function cancelCutoffMs(order) {
+  const closingTime = order.closingTime || DEFAULT_CLOSING_TIME;
+  const graceMinutes = Number.isFinite(Number(order.graceMinutes)) ? Number(order.graceMinutes) : DEFAULT_GRACE_MIN;
+  const cancelWindowMinutes = Number.isFinite(Number(order.cancelWindowMinutes)) ? Number(order.cancelWindowMinutes) : DEFAULT_CANCEL_WINDOW_MIN;
+  const dateKey = order.dateKey || istDateKey();
+  // dateKey is an IST calendar date ("YYYY-MM-DD"); closingTime is an IST
+  // clock time ("HH:MM"). Combining them with an explicit +05:30 offset
+  // gives an unambiguous instant regardless of the server's own timezone.
+  const closingMs = new Date(`${dateKey}T${closingTime}:00+05:30`).getTime();
+  return closingMs + (graceMinutes + cancelWindowMinutes) * 60 * 1000;
 }
 
 /* Self-healing pool recalculation — and the single source of truth for
@@ -147,11 +176,14 @@ router.post("/", requireAuth, async (req, res) => {
       total,
       dateKey,
       status: "held",
-      // Snapshot the delivery window at order time so a later admin change
-      // to the default window doesn't retroactively rewrite what a
-      // customer was already told for an order in flight.
+      // Snapshot the delivery window — and everything the cancellation
+      // deadline is computed from — at order time, so a later admin
+      // settings change doesn't retroactively rewrite what a customer was
+      // already told, or move an in-flight order's cancel deadline.
       deliveryWindowStart: settings.deliveryWindowStart,
       deliveryWindowEnd: settings.deliveryWindowEnd,
+      closingTime: settings.closingTime,
+      graceMinutes: settings.graceMinutes,
       cancelWindowMinutes: settings.cancelWindowMinutes,
       createdAt: new Date().toISOString(),
     };
@@ -254,9 +286,10 @@ router.patch("/:id/deliver", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* Customer cancels their own order. Allowed only within the admin-set
-   cancelWindowMinutes counted from when the order was placed — the
-   front-end hides the Cancel button once that window closes, but this
+/* Customer cancels their own order. Allowed until the shared daily
+   deadline computed by cancelCutoffMs() — closing time + extra time +
+   the admin's cancellation allowance — not a per-order countdown. The
+   front-end hides the Cancel button once that deadline passes, but this
    endpoint enforces it regardless of what the client sends. */
 router.patch("/:id/cancel", requireAuth, async (req, res) => {
   try {
@@ -277,13 +310,10 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "The kitchen has already started preparing this order — it can't be cancelled anymore." });
     }
 
-    const cancelWindowMinutes = Number.isFinite(Number(order.cancelWindowMinutes))
-      ? Number(order.cancelWindowMinutes)
-      : (await getSettings()).cancelWindowMinutes;
-    const placedAt = new Date(order.createdAt).getTime();
-    const deadline = placedAt + cancelWindowMinutes * 60 * 1000;
-    if (Number.isFinite(placedAt) && Date.now() > deadline) {
-      return res.status(400).json({ error: `The ${cancelWindowMinutes}-minute cancellation window for this order has closed.` });
+    const cutoffMs = cancelCutoffMs(order);
+    if (Date.now() > cutoffMs) {
+      const cutoffLabel = new Date(cutoffMs).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" });
+      return res.status(400).json({ error: `The cancellation window for today's orders closed at ${cutoffLabel}.` });
     }
 
     await ref.update({ status: "cancelled", cancelledAt: new Date().toISOString() });
