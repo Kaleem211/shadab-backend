@@ -18,7 +18,7 @@ async function sendOtpEmail(to, code, purpose) {
     <div style="font-size:32px;font-weight:700;letter-spacing:8px;background:#111;color:#e6c35c;padding:16px;border-radius:8px;text-align:center;margin:16px 0;">
       ${code}
     </div>
-    <p style="color:#666;font-size:14px;">This code expires in 10 minutes. If you didn't request this, you can ignore this email.</p>
+    <p style="color:#666;font-size:14px;">This code expires in 2 minutes. If you didn't request this, you can ignore this email.</p>
   </div>`;
 
   const res = await fetch("https://api.brevo.com/v3/smtp/email", {
@@ -46,3 +46,4 @@ async function sendOtpEmail(to, code, purpose) {
 }
 
 module.exports = { sendOtpEmail };
+        
