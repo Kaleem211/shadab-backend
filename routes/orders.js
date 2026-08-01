@@ -185,8 +185,21 @@ async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
     return met ? status === "held" : status === "confirmed";
   });
   if (toFlip.length) {
+    // confirmedAt is stamped the moment an order actually crosses
+    // held -> confirmed, and is what the front-end's progress tracker
+    // uses to animate the "Confirmed" segment continuously across the
+    // order's real confirmed lifetime — not just the tail end of the
+    // cancellation window. Cleared (set back to null) on the reverse
+    // confirmed -> held sweep so a later re-confirmation gets an honest,
+    // fresh timestamp instead of reusing a stale one.
+    const nowIso = new Date().toISOString();
     const batch = db.batch();
-    toFlip.forEach((doc) => batch.update(doc.ref, { status: met ? "confirmed" : "held" }));
+    toFlip.forEach((doc) =>
+      batch.update(doc.ref, {
+        status: met ? "confirmed" : "held",
+        confirmedAt: met ? nowIso : null,
+      })
+    );
     await batch.commit();
   }
 
@@ -426,7 +439,8 @@ router.post("/deliver-today/undo", requireAdmin, async (req, res) => {
     if (!broadcast || !Array.isArray(broadcast.orderIds) || !broadcast.orderIds.length) {
       return res.status(400).json({ error: "There's nothing to undo." });
     }
-const docs = await Promise.all(broadcast.orderIds.map((id) => ordersCol.doc(id).get()));
+
+    const docs = await Promise.all(broadcast.orderIds.map((id) => ordersCol.doc(id).get()));
     const toRevert = docs.filter((doc) => {
       if (!doc.exists) return false;
       const o = doc.data();
@@ -528,4 +542,3 @@ router.delete("/", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
-   
