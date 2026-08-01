@@ -7,10 +7,67 @@ const router = express.Router();
 const ordersCol = db.collection("orders");
 const poolsCol = db.collection("pools");
 const settingsDoc = db.collection("settings").doc("config");
+// Single doc that tracks the ADMIN DASHBOARD's own "clear" cutoff — kept
+// completely separate from the `orders` collection itself. See
+// getAdminDashboardState()/clearAdminDashboard() below for why: clearing
+// the dashboard must never touch a customer's real order data.
+const adminStateDoc = db.collection("adminState").doc("dashboard");
 const DEFAULT_MIN_POOL = 600;
 const DEFAULT_CANCEL_WINDOW_MIN = 15;
 const DEFAULT_CLOSING_TIME = "19:15";
 const DEFAULT_GRACE_MIN = 3;
+
+/* The admin's "Clear Orders" button used to hard-delete every order
+   document — wiping customers' own order history along with the admin's
+   view of it. It now only clears the ADMIN DASHBOARD's view: this doc
+   stores a `clearedAt` cutoff, and the admin's GET /orders endpoint hides
+   any order placed at or before it. Nothing in the `orders` collection is
+   ever touched, so a customer's "My Orders" always shows their real,
+   complete history regardless of what the admin has cleared.
+   `previousClearedAt` remembers the cutoff that was in effect just before
+   the most recent clear (manual or automatic), so a single "Restore" can
+   undo it — same one-level-undo pattern as /deliver-today/undo. */
+async function getAdminDashboardState() {
+  try {
+    const doc = await adminStateDoc.get();
+    const data = doc.exists ? doc.data() : {};
+    return { clearedAt: data.clearedAt || null, previousClearedAt: data.previousClearedAt || null };
+  } catch {
+    return { clearedAt: null, previousClearedAt: null };
+  }
+}
+async function clearAdminDashboard() {
+  const state = await getAdminDashboardState();
+  const now = new Date().toISOString();
+  await adminStateDoc.set({ clearedAt: now, previousClearedAt: state.clearedAt || null }, { merge: true });
+  return now;
+}
+/* Runs after any action that could finish off the day's kitchen work
+   (marking an order delivered, or the deliver-today broadcast). If every
+   order currently visible on the admin dashboard is now either delivered
+   or cancelled — and at least one was actually delivered, so this never
+   fires on a dashboard that's already empty — the dashboard clears itself
+   automatically, exactly as if the admin had tapped Clear Orders by hand.
+   Being routed through clearAdminDashboard() means an automatic clear is
+   just as restorable as a manual one. */
+async function maybeAutoClearDashboard() {
+  try {
+    const state = await getAdminDashboardState();
+    const snap = await ordersCol.get();
+    const visible = [];
+    snap.forEach((doc) => {
+      const o = doc.data();
+      if (!state.clearedAt || !o.createdAt || o.createdAt > state.clearedAt) visible.push(o);
+    });
+    if (!visible.length) return;
+    const stillActive = visible.some((o) => !["delivered", "cancelled"].includes(o.status));
+    const hasDelivered = visible.some((o) => o.status === "delivered");
+    if (!stillActive && hasDelivered) await clearAdminDashboard();
+  } catch (err) {
+    console.error("Auto-clear check failed:", err);
+  }
+}
+
 
 /* All orders for a calendar day (IST, since that's the restaurant's
    timezone) pool together. Orders sit as status "held" — shown to the
@@ -318,7 +375,15 @@ router.get("/", requireAdmin, async (req, res) => {
   const orders = [];
   snap.forEach((doc) => orders.push(doc.data()));
   orders.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-  res.json({ ok: true, orders });
+  const state = await getAdminDashboardState();
+  // Orders placed at or before the dashboard's clearedAt cutoff stay out
+  // of the admin's view (they're still fully intact in Firestore, and
+  // still visible to the customer on their own My Orders) until the admin
+  // restores. See clearAdminDashboard() above for how the cutoff is set.
+  const visible = state.clearedAt
+    ? orders.filter((o) => !o.createdAt || o.createdAt > state.clearedAt)
+    : orders;
+  res.json({ ok: true, orders: visible, dashboardClearedAt: state.clearedAt, canRestore: !!state.clearedAt });
 });
 
 /* Admin moves an order through the kitchen stages. "preparing" is only
@@ -349,6 +414,7 @@ router.patch("/:id/status", requireAdmin, async (req, res) => {
     return res.status(400).json({ error: `Can't mark delivered from '${current}'.` });
   }
   await ref.update({ status, [`${status}At`]: new Date().toISOString() });
+  if (status === "delivered") await maybeAutoClearDashboard();
   res.json({ ok: true });
 });
 
@@ -366,6 +432,7 @@ router.patch("/:id/deliver", requireAdmin, async (req, res) => {
     return res.status(400).json({ error: "This order was cancelled." });
   }
   await ref.update({ status: "delivered", deliveredAt: new Date().toISOString() });
+  await maybeAutoClearDashboard();
   res.json({ ok: true });
 });
 
@@ -415,6 +482,7 @@ router.post("/deliver-today", requireAdmin, async (req, res) => {
       { merge: true }
     );
 
+    await maybeAutoClearDashboard();
     res.json({ ok: true, deliveredCount: toDeliver.length, deliveryArrivedAt: now });
   } catch (err) {
     console.error(err);
@@ -522,23 +590,38 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
   }
 });
 
-/* Clears every order AND every day's pool record. The pool banner
-   ("₹970 of ₹600 reached") lives in a separate `pools` collection keyed
-   by calendar date — wiping only `orders` left that collection untouched,
-   so the banner kept showing stale totals forever after a clear, no
-   matter what today's date was. Deleting every doc in `pools` (not just
-   today's) means the very next order placed — on any date — starts the
-   count fresh from ₹0. */
+/* Clears the ADMIN DASHBOARD only — see clearAdminDashboard() above. This
+   used to hard-delete every order (and every pool record) permanently,
+   which meant an admin's accidental tap wiped customers' own order
+   history along with it. Now it just stamps a clearedAt cutoff: no order
+   document and no pool record is ever deleted. Customers keep their full
+   "My Orders" history no matter how many times the admin clears. */
 router.delete("/", requireAdmin, async (req, res) => {
-  const snap = await ordersCol.get();
-  const batch = db.batch();
-  snap.forEach((doc) => batch.delete(doc.ref));
+  try {
+    const clearedAt = await clearAdminDashboard();
+    res.json({ ok: true, clearedAt });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't clear the dashboard." });
+  }
+});
 
-  const poolsSnap = await poolsCol.get();
-  poolsSnap.forEach((doc) => batch.delete(doc.ref));
-
-  await batch.commit();
-  res.json({ ok: true });
+/* Undoes the most recent dashboard clear — manual (the button above) or
+   automatic (maybeAutoClearDashboard, once every order's verified
+   delivered) — bringing back exactly the orders it hid. One level deep,
+   same as /deliver-today/undo: restoring twice with no clear in between
+   has no further effect. */
+router.post("/clear-dashboard/undo", requireAdmin, async (req, res) => {
+  try {
+    const state = await getAdminDashboardState();
+    if (!state.clearedAt) return res.status(400).json({ error: "There's nothing to restore." });
+    await adminStateDoc.set({ clearedAt: state.previousClearedAt || null, previousClearedAt: null }, { merge: true });
+    res.json({ ok: true, clearedAt: state.previousClearedAt || null });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't restore the dashboard." });
+  }
 });
 
 module.exports = router;
+   
