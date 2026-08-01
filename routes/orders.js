@@ -413,7 +413,12 @@ router.patch("/:id/status", requireAdmin, async (req, res) => {
   if (status === "delivered" && !["confirmed", "preparing"].includes(current)) {
     return res.status(400).json({ error: `Can't mark delivered from '${current}'.` });
   }
-  await ref.update({ status, [`${status}At`]: new Date().toISOString() });
+  const update = { status, [`${status}At`]: new Date().toISOString() };
+  // Remember exactly what the order was before it became "delivered" so a
+  // single per-order "undeliver" (PATCH /:id/undeliver below) can restore
+  // it honestly instead of guessing "confirmed" for every case.
+  if (status === "delivered") update.preDeliveryStatus = current;
+  await ref.update(update);
   if (status === "delivered") await maybeAutoClearDashboard();
   res.json({ ok: true });
 });
@@ -431,9 +436,37 @@ router.patch("/:id/deliver", requireAdmin, async (req, res) => {
   if (current === "cancelled") {
     return res.status(400).json({ error: "This order was cancelled." });
   }
-  await ref.update({ status: "delivered", deliveredAt: new Date().toISOString() });
+  await ref.update({ status: "delivered", deliveredAt: new Date().toISOString(), preDeliveryStatus: current });
   await maybeAutoClearDashboard();
   res.json({ ok: true });
+});
+
+/* Reverses a single order's "delivered" status — the per-order companion
+   to /deliver-today/undo below. Without this, unticking the "Delivered"
+   checkbox in the admin's Verify Orders panel had nothing to actually call
+   on the backend: the very next poll re-fetched the order still sitting at
+   status "delivered", and the checkbox visibly snapped back to checked a
+   moment after the admin unchecked it — the reported "verification
+   glitch". This restores whatever status the order was in immediately
+   before it was marked delivered (stamped as preDeliveryStatus the instant
+   that happened), falling back to "confirmed" for any older order placed
+   before this field existed. */
+router.patch("/:id/undeliver", requireAdmin, async (req, res) => {
+  try {
+    const ref = ordersCol.doc(req.params.id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
+    const order = doc.data();
+    if (order.status !== "delivered") {
+      return res.status(400).json({ error: "This order isn't marked delivered." });
+    }
+    const restoredStatus = order.preDeliveryStatus || "confirmed";
+    await ref.update({ status: restoredStatus, deliveredAt: null, preDeliveryStatus: null });
+    res.json({ ok: true, status: restoredStatus });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't undo delivery for this order." });
+  }
 });
 
 /* Admin's single "Delivery arrived" broadcast for the day. Rather than
@@ -624,4 +657,4 @@ router.post("/clear-dashboard/undo", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
-   
+       
