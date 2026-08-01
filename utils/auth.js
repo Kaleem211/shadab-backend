@@ -96,4 +96,5 @@ function genOtp() {
 }
 
 module.exports = { signToken, requireAuth, requireAdmin, hashPassword, checkPassword, genOtp };
-  
+
+                                           
