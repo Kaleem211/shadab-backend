@@ -4,10 +4,14 @@ const rateLimit = require("express-rate-limit");
 const db = require("../db");
 const { sendOtpEmail } = require("../mailer");
 const { signToken, hashPassword, checkPassword, genOtp, requireAuth } = require("../utils/auth");
+const { validateCampusEmail } = require("../utils/campusEmail");
 
 const router = express.Router();
 
 const otpLimiter = rateLimit({ windowMs: 10 * 60 * 1000, max: 8, message: { error: "Too many attempts, please wait a few minutes." } });
+
+// OTPs are valid for 1 minute 30 seconds.
+const OTP_TTL_MS = 90 * 1000;
 
 const isValidEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
 const isValidMobile = (m) => /^\d{10}$/.test(m);
@@ -51,14 +55,17 @@ router.post("/signup", otpLimiter, async (req, res) => {
 
     if (!username || !username.trim()) return res.status(400).json({ error: "Enter a username." });
     if (!isValidMobile(mobile || "")) return res.status(400).json({ error: "Enter a valid 10-digit mobile number." });
-    if (!isValidEmail(email)) return res.status(400).json({ error: "Enter a valid email address." });
+
+    const emailCheck = validateCampusEmail(email);
+    if (!emailCheck.ok) return res.status(422).json({ error: emailCheck.error, code: emailCheck.code });
+
     if (!password || password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
 
     if (await findUserByMobile(mobile)) return res.status(409).json({ error: "An account with this mobile number already exists." });
     if (await findUserByEmail(email)) return res.status(409).json({ error: "An account with this email already exists." });
 
     const code = genOtp();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
     const passwordHash = await hashPassword(password);
     const payload = JSON.stringify({ username: username.trim(), mobile, email, passwordHash });
 
@@ -87,7 +94,7 @@ router.post("/signup/resend", otpLimiter, async (req, res) => {
     if (!row) return res.status(400).json({ error: "Start sign up again — no pending verification found." });
 
     const code = genOtp();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
     await otpsCol.doc(row.id).update({ code, expiresAt });
 
     await sendOtpEmail(email, code, "signup");
@@ -104,9 +111,9 @@ router.post("/signup/verify", async (req, res) => {
     const otp = (req.body?.otp || "").trim();
 
     const row = await findLatestOtp(email, "signup");
-    if (!row) return res.status(400).json({ error: "Start sign up again — no pending verification found." });
-    if (new Date(row.expiresAt) < new Date()) return res.status(400).json({ error: "Code expired. Request a new one." });
-    if (row.code !== otp) return res.status(400).json({ error: "Incorrect code. Try again." });
+    if (!row) return res.status(400).json({ error: "Start sign up again — no pending verification found.", code: "otp_missing" });
+    if (new Date(row.expiresAt) < new Date()) return res.status(400).json({ error: "OTP expired. Please request a new one.", code: "otp_expired" });
+    if (row.code !== otp) return res.status(400).json({ error: "Incorrect code. Try again.", code: "otp_incorrect" });
 
     const { username, mobile, passwordHash } = JSON.parse(row.payload);
 
@@ -135,10 +142,10 @@ router.post("/login", async (req, res) => {
     if (!identifier || !password) return res.status(400).json({ error: "Enter your mobile/email and password." });
 
     const user = isValidMobile(identifier) ? await findUserByMobile(identifier) : await findUserByEmail(identifier);
-    if (!user) return res.status(401).json({ error: "Incorrect details. Check and try again, or create an account." });
+    if (!user) return res.status(401).json({ error: "This account isn't registered. Check your details or create an account.", code: "invalid_credentials" });
 
     const ok = await checkPassword(password, user.passwordHash);
-    if (!ok) return res.status(401).json({ error: "Incorrect details. Check and try again, or create an account." });
+    if (!ok) return res.status(401).json({ error: "Incorrect password. Please try again.", code: "invalid_credentials" });
 
     const token = signToken(user);
     res.json({ ok: true, token, user: { id: user.id, username: user.username, mobile: user.mobile, email: user.email } });
@@ -154,7 +161,7 @@ router.post("/forgot-password", otpLimiter, async (req, res) => {
     const user = await findUserByEmail(email);
     if (user) {
       const code = genOtp();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
 
       const oldSnap = await otpsCol.where("email", "==", email).where("purpose", "==", "reset").get();
       const batch = db.batch();
@@ -180,7 +187,7 @@ router.post("/forgot-password/resend", otpLimiter, async (req, res) => {
     const row = await findLatestOtp(email, "reset");
     if (!row) return res.json({ ok: true });
     const code = genOtp();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
     await otpsCol.doc(row.id).update({ code, expiresAt });
     await sendOtpEmail(email, code, "reset");
     res.json({ ok: true });
@@ -196,9 +203,9 @@ router.post("/forgot-password/verify", async (req, res) => {
     const otp = (req.body?.otp || "").trim();
 
     const row = await findLatestOtp(email, "reset");
-    if (!row) return res.status(400).json({ error: "Request a new code." });
-    if (new Date(row.expiresAt) < new Date()) return res.status(400).json({ error: "Code expired. Request a new one." });
-    if (row.code !== otp) return res.status(400).json({ error: "Incorrect code. Try again." });
+    if (!row) return res.status(400).json({ error: "Request a new code.", code: "otp_missing" });
+    if (new Date(row.expiresAt) < new Date()) return res.status(400).json({ error: "OTP expired. Please request a new one.", code: "otp_expired" });
+    if (row.code !== otp) return res.status(400).json({ error: "Incorrect code. Try again.", code: "otp_incorrect" });
 
     await otpsCol.doc(row.id).update({ consumed: true });
 
@@ -252,4 +259,5 @@ router.patch("/me", requireAuth, async (req, res) => {
 });
 
 module.exports = router;
-    
+
+
