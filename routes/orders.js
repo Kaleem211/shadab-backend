@@ -383,7 +383,33 @@ router.get("/", requireAdmin, async (req, res) => {
   const visible = state.clearedAt
     ? orders.filter((o) => !o.createdAt || o.createdAt > state.clearedAt)
     : orders;
-  res.json({ ok: true, orders: visible, dashboardClearedAt: state.clearedAt, canRestore: !!state.clearedAt });
+
+  // The admin dashboard's pool banner used to always show the real,
+  // day-wide pool total (same figure reconcilePool uses to decide order
+  // confirmation) — which meant it kept reading "₹640 of ₹600 reached"
+  // even right after Clear Orders, sitting above a completely empty list
+  // with "0 Active orders". That's not actually a data bug: those earlier
+  // orders are still real and still count toward today's minimum for
+  // confirmation purposes, they've just been hidden from THIS view. But
+  // shown next to an empty dashboard it reads as broken. So the banner
+  // now gets its own total computed only from what's currently VISIBLE
+  // on the dashboard (i.e. respecting the clearedAt cutoff) — purely a
+  // display figure. The real, authoritative total used to confirm orders
+  // (GET /orders/pool-status, what customers see) is completely
+  // unaffected by this and keeps accumulating across the whole day
+  // regardless of what the admin has cleared from their own view.
+  const dateKey = istDateKey();
+  const settings = await getSettings();
+  const visibleTodayTotal = visible
+    .filter((o) => o.status !== "cancelled" && (o.dateKey || dateKey) === dateKey)
+    .reduce((sum, o) => sum + (o.total || 0), 0);
+  const adminPool = {
+    total: visibleTodayTotal,
+    minAmount: settings.minOrderPoolAmount,
+    met: visibleTodayTotal >= settings.minOrderPoolAmount,
+  };
+
+  res.json({ ok: true, orders: visible, dashboardClearedAt: state.clearedAt, canRestore: !!state.clearedAt, adminPool });
 });
 
 /* Admin moves an order through the kitchen stages. "preparing" is only
@@ -657,4 +683,3 @@ router.post("/clear-dashboard/undo", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
-       
