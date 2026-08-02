@@ -144,6 +144,10 @@ router.post("/login", async (req, res) => {
     const user = isValidMobile(identifier) ? await findUserByMobile(identifier) : await findUserByEmail(identifier);
     if (!user) return res.status(401).json({ error: "This account isn't registered. Check your details or create an account.", code: "invalid_credentials" });
 
+    if (user.blocked) {
+      return res.status(403).json({ error: "This account has been blocked. Contact the restaurant if you think this is a mistake.", code: "account_blocked" });
+    }
+
     const ok = await checkPassword(password, user.passwordHash);
     if (!ok) return res.status(401).json({ error: "Incorrect password. Please try again.", code: "invalid_credentials" });
 
@@ -177,6 +181,9 @@ router.post("/forgot-password", otpLimiter, async (req, res) => {
         error: "No account is registered with this email.",
         code: "not_registered",
       });
+    }
+    if (user.blocked) {
+      return res.status(403).json({ error: "This account has been blocked. Contact the restaurant if you think this is a mistake.", code: "account_blocked" });
     }
 
     const code = genOtp();
@@ -256,10 +263,50 @@ router.post("/reset-password", async (req, res) => {
     if (user) await usersCol.doc(user.id).update({ passwordHash: hash });
     await resetTokensCol.doc(resetToken).update({ used: true });
 
-    res.json({ ok: true, message: "Password updated. You can log in now." });
+    // They just proved ownership of this account via OTP and set a new
+    // password — no reason to make them log in again with it right away.
+    const token = user ? signToken(user) : null;
+    res.json({
+      ok: true,
+      message: "Password updated. You're logged in.",
+      token,
+      user: user ? { id: user.id, username: user.username, mobile: user.mobile, email: user.email } : null,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Couldn't reset the password." });
+  }
+});
+
+/* "Skip for now" on the reset-password step. The person already proved
+   they own this account by completing the email OTP a moment ago — that's
+   the same proof of identity /reset-password relies on — so if they don't
+   want to change their password right now, there's no good reason to also
+   make them go type it in again on the login screen. This consumes the
+   same one-time resetToken (so it can't also be used for /reset-password
+   afterward) and simply logs them in, exactly as /login would after a
+   correct password. */
+router.post("/forgot-password/skip", async (req, res) => {
+  try {
+    const { email: rawEmail, resetToken } = req.body || {};
+    const email = (rawEmail || "").trim().toLowerCase();
+
+    const tokenDoc = await resetTokensCol.doc(resetToken || "").get();
+    if (!tokenDoc.exists) return res.status(400).json({ error: "Reset session expired. Start the process again." });
+    const row = tokenDoc.data();
+    if (row.email !== email || row.used) return res.status(400).json({ error: "Reset session expired. Start the process again." });
+    if (new Date(row.expiresAt) < new Date()) return res.status(400).json({ error: "Reset session expired. Start the process again." });
+
+    const user = await findUserByEmail(email);
+    if (!user) return res.status(404).json({ error: "Account not found." });
+
+    await resetTokensCol.doc(resetToken).update({ used: true });
+
+    const token = signToken(user);
+    res.json({ ok: true, token, user: { id: user.id, username: user.username, mobile: user.mobile, email: user.email } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't complete verification." });
   }
 });
 
@@ -278,4 +325,4 @@ router.patch("/me", requireAuth, async (req, res) => {
 });
 
 module.exports = router;
-    
+
