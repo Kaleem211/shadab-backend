@@ -562,30 +562,45 @@ router.post("/deliver-today/undo", requireAdmin, async (req, res) => {
     const poolRef = poolsCol.doc(dateKey);
     const poolSnap = await poolRef.get();
     const pool = poolSnap.exists ? poolSnap.data() : {};
-    const broadcast = pool.lastDeliveryBroadcast;
-    if (!broadcast || !Array.isArray(broadcast.orderIds) || !broadcast.orderIds.length) {
+
+    // The only thing that actually decides whether there's something to
+    // undo is whether the "delivery arrived" notification is currently
+    // live — NOT whether the broadcast happened to move any orders. A
+    // broadcast can legitimately touch zero orders (e.g. the admin had
+    // already delivered every order individually before tapping the
+    // broadcast button) while still setting deliveryArrivedAt and showing
+    // the notice to customers. Gating on orderIds.length here was the bug:
+    // it left that notice permanently un-undoable whenever the batch was
+    // empty, even though the button (driven by the same deliveryArrivedAt
+    // flag) told the admin an undo was available.
+    if (!pool.deliveryArrivedAt) {
       return res.status(400).json({ error: "There's nothing to undo." });
     }
 
-    const docs = await Promise.all(broadcast.orderIds.map((id) => ordersCol.doc(id).get()));
-    const toRevert = docs.filter((doc) => {
-      if (!doc.exists) return false;
-      const o = doc.data();
-      return o.status === "delivered" && o.deliveredAt === broadcast.at;
-    });
-
-    if (toRevert.length) {
-      const batch = db.batch();
-      toRevert.forEach((doc) => {
-        const restoredStatus = broadcast.previousStatuses[doc.id] || "confirmed";
-        batch.update(doc.ref, { status: restoredStatus, deliveredAt: null });
+    const broadcast = pool.lastDeliveryBroadcast;
+    let revertedCount = 0;
+    if (broadcast && Array.isArray(broadcast.orderIds) && broadcast.orderIds.length) {
+      const docs = await Promise.all(broadcast.orderIds.map((id) => ordersCol.doc(id).get()));
+      const toRevert = docs.filter((doc) => {
+        if (!doc.exists) return false;
+        const o = doc.data();
+        return o.status === "delivered" && o.deliveredAt === broadcast.at;
       });
-      await batch.commit();
+
+      if (toRevert.length) {
+        const batch = db.batch();
+        toRevert.forEach((doc) => {
+          const restoredStatus = broadcast.previousStatuses[doc.id] || "confirmed";
+          batch.update(doc.ref, { status: restoredStatus, deliveredAt: null });
+        });
+        await batch.commit();
+      }
+      revertedCount = toRevert.length;
     }
 
     await poolRef.set({ dateKey, deliveryArrivedAt: null, lastDeliveryBroadcast: null }, { merge: true });
 
-    res.json({ ok: true, revertedCount: toRevert.length });
+    res.json({ ok: true, revertedCount });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Couldn't undo today's delivery broadcast." });
@@ -683,4 +698,3 @@ router.post("/clear-dashboard/undo", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
-     
