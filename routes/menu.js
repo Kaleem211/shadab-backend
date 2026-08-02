@@ -22,7 +22,24 @@ router.get("/", async (req, res) => {
 router.put("/:id", requireAdmin, async (req, res) => {
   try {
     const id = req.params.id;
-    const data = { ...req.body, id };
+    const body = req.body || {};
+
+    // This doc is now what order totals are priced against server-side
+    // (see utils/menuCatalog.js), so a bad price here isn't just a display
+    // bug — it would become the real charged amount. `deleted: true` docs
+    // (used to hide a base item) skip the price/name checks since they
+    // intentionally carry whatever fields were last saved on that item.
+    if (!body.deleted) {
+      const price = Number(body.price);
+      if (!Number.isFinite(price) || price <= 0 || price > 100000) {
+        return res.status(400).json({ error: "Enter a valid price." });
+      }
+      if (!body.name || !String(body.name).trim()) {
+        return res.status(400).json({ error: "Enter a valid name." });
+      }
+    }
+
+    const data = { ...body, id };
     await menuCol.doc(id).set(data);
     res.json({ ok: true, item: data });
   } catch (err) {
@@ -58,4 +75,5 @@ router.delete("/", requireAdmin, async (req, res) => {
 
 module.exports = router;
 
-              
+
+  
