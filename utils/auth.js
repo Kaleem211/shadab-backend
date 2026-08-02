@@ -13,16 +13,33 @@ function signToken(user) {
   );
 }
 
-function requireAuth(req, res, next) {
+const usersCol = db.collection("users");
+
+async function requireAuth(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Not logged in." });
+  let identity;
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
+    identity = jwt.verify(token, JWT_SECRET);
   } catch {
     return res.status(401).json({ error: "Session expired, please log in again." });
   }
+  // A JWT stays valid for 30 days regardless of anything that happens to
+  // the account after it's issued, so an admin blocking someone wouldn't
+  // otherwise take effect until that token expired on its own. This one
+  // extra lookup is what makes a block immediate for someone already
+  // mid-session, not just for their next login attempt.
+  try {
+    const doc = await usersCol.doc(identity.id).get();
+    if (doc.exists && doc.data().blocked) {
+      return res.status(403).json({ error: "This account has been blocked. Contact the restaurant if you think this is a mistake.", code: "account_blocked" });
+    }
+  } catch (err) {
+    console.error("Block-status check failed:", err);
+  }
+  req.user = identity;
+  next();
 }
 
 /* Admin access now requires BOTH the shared admin password AND a logged-in
@@ -96,5 +113,4 @@ function genOtp() {
 }
 
 module.exports = { signToken, requireAuth, requireAdmin, hashPassword, checkPassword, genOtp };
-
-                                           
+  
