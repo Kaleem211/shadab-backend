@@ -158,23 +158,42 @@ router.post("/login", async (req, res) => {
 router.post("/forgot-password", otpLimiter, async (req, res) => {
   try {
     const email = (req.body?.email || "").trim().toLowerCase();
+
+    // Same college-email policy as sign up, so this field can't be used
+    // to probe with arbitrary/malformed addresses.
+    const emailCheck = validateCampusEmail(email);
+    if (!emailCheck.ok) return res.status(422).json({ error: emailCheck.error, code: emailCheck.code });
+
+    // NOTE (intentional product decision, not an oversight): this confirms
+    // whether an account exists, which is a deliberate UX trade-off against
+    // the usual "don't reveal account existence" best practice. It's scoped
+    // to a closed campus email domain and already covered by otpLimiter's
+    // rate limiting, which keeps this from being a practical enumeration
+    // vector. If that changes (e.g. this domain opens up publicly), switch
+    // this back to the generic "if that email has an account…" response.
     const user = await findUserByEmail(email);
-    if (user) {
-      const code = genOtp();
-      const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
-
-      const oldSnap = await otpsCol.where("email", "==", email).where("purpose", "==", "reset").get();
-      const batch = db.batch();
-      oldSnap.forEach((doc) => batch.delete(doc.ref));
-      await batch.commit();
-
-      await otpsCol.add({
-        email, code, purpose: "reset",
-        expiresAt, consumed: false, createdAt: new Date().toISOString(),
+    if (!user) {
+      return res.status(404).json({
+        error: "No account is registered with this email.",
+        code: "not_registered",
       });
-      await sendOtpEmail(email, code, "reset");
     }
-    res.json({ ok: true, message: "If that email has an account, a code has been sent." });
+
+    const code = genOtp();
+    const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
+
+    const oldSnap = await otpsCol.where("email", "==", email).where("purpose", "==", "reset").get();
+    const batch = db.batch();
+    oldSnap.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    await otpsCol.add({
+      email, code, purpose: "reset",
+      expiresAt, consumed: false, createdAt: new Date().toISOString(),
+    });
+    await sendOtpEmail(email, code, "reset");
+
+    res.json({ ok: true, message: "Reset code sent to your email." });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Couldn't send the reset email. Please try again shortly." });
@@ -185,7 +204,7 @@ router.post("/forgot-password/resend", otpLimiter, async (req, res) => {
   try {
     const email = (req.body?.email || "").trim().toLowerCase();
     const row = await findLatestOtp(email, "reset");
-    if (!row) return res.json({ ok: true });
+    if (!row) return res.status(400).json({ error: "Request a new code.", code: "otp_missing" });
     const code = genOtp();
     const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
     await otpsCol.doc(row.id).update({ code, expiresAt });
@@ -259,5 +278,4 @@ router.patch("/me", requireAuth, async (req, res) => {
 });
 
 module.exports = router;
-
-
+    
