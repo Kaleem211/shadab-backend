@@ -7,6 +7,7 @@ const orderRoutes = require("./routes/orders");
 const menuRoutes = require("./routes/menu");
 const settingsRoutes = require("./routes/settings");
 const adminsRoutes = require("./routes/admins");
+const customersRoutes = require("./routes/customers");
 
 // Fail fast with a clear message if required secrets are missing.
 ["GMAIL_USER", "GMAIL_APP_PASSWORD", "JWT_SECRET", "ADMIN_PASSWORD"].forEach((k) => {
@@ -35,6 +36,7 @@ app.use("/api/orders", orderRoutes);
 app.use("/api/menu", menuRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/admins", adminsRoutes);
+app.use("/api/customers", customersRoutes);
 
 app.use((err, req, res, next) => {
   console.error(err);
@@ -43,4 +45,5 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Shadab backend listening on port ${PORT}`));
-    
+
+  
