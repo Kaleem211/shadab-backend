@@ -176,6 +176,30 @@ router.patch("/:id/unblock", requireAdmin, async (req, res) => {
   }
 });
 
+/* Resets a customer back to a blank slate: wipes their entire order
+   history and lifts any block, but keeps the login itself (mobile,
+   email, password) so they don't have to sign up again — the account
+   behaves exactly like a brand-new registration afterward. */
+router.patch("/:id/clear-data", requireAdmin, async (req, res) => {
+  try {
+    const ref = usersCol.doc(req.params.id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Customer not found." });
+    const u = doc.data();
+
+    const ordersSnap = await ordersCol.where("userMobile", "==", u.mobile).get();
+    const batch = db.batch();
+    ordersSnap.forEach((odoc) => batch.delete(odoc.ref));
+    batch.update(ref, { blocked: false, blockedAt: null, blockedBy: null });
+    await batch.commit();
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't clear that customer's data." });
+  }
+});
+
 /* Permanently removes the account. Their past orders are left untouched
    (they're the restaurant's own historical records, not the account's),
    so this only deletes the login/profile itself. */
@@ -196,4 +220,4 @@ router.delete("/:id", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
-      
+       
