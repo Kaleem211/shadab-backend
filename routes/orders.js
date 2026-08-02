@@ -2,6 +2,7 @@ const express = require("express");
 const crypto = require("crypto");
 const db = require("../db");
 const { requireAuth, requireAdmin } = require("../utils/auth");
+const { getOrderableMenu } = require("../utils/menuCatalog");
 
 const router = express.Router();
 const ordersCol = db.collection("orders");
@@ -286,11 +287,65 @@ async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
   return { total: activeTotal, minAmount: minPool, met, deliveryArrivedAt };
 }
 
+/* Rebuilds the order's items/total from the server's own menu catalog
+   instead of trusting whatever the client sent. Previously `items` and
+   `total` came straight from req.body — anyone with devtools (or curl)
+   could submit total: 1 for a full cart, or add items that don't exist,
+   and the order would be saved and confirmed exactly as sent. Now only
+   the item id + quantity from the client are used; name, price and note
+   always come from the live catalog (BASE_MENU + admin overrides), so
+   the price actually charged always matches what's really on the menu.
+   Throws with a user-facing message on any bad input; callers should
+   catch and turn that into a 400. */
+async function priceOrderItems(rawItems) {
+  if (!Array.isArray(rawItems) || !rawItems.length) {
+    throw Object.assign(new Error("Cart is empty."), { status: 400 });
+  }
+  const catalog = await getOrderableMenu();
+  const priced = [];
+  let total = 0;
+
+  for (const raw of rawItems) {
+    const id = raw && raw.id;
+    const qty = Number(raw && raw.qty);
+    if (!id || typeof id !== "string") {
+      throw Object.assign(new Error("Invalid item in cart."), { status: 400 });
+    }
+    if (!Number.isInteger(qty) || qty <= 0 || qty > 50) {
+      throw Object.assign(new Error("Invalid quantity for one of the items."), { status: 400 });
+    }
+    const item = catalog.get(id);
+    if (!item) {
+      throw Object.assign(
+        new Error("One or more items in your cart are no longer available. Please refresh the menu and try again."),
+        { status: 409 }
+      );
+    }
+    priced.push({ id: item.id, name: item.name, note: item.note || "", price: item.price, qty });
+    total += item.price * qty;
+  }
+
+  return { items: priced, total };
+}
+
+// Trims, coerces to string, and caps length on free-text fields the
+// customer controls (name/address) — belt-and-suspenders alongside the
+// frontend's HTML-escaping so no single rendering context has to be the
+// only thing standing between this input and a security bug.
+const cleanText = (v, max) => String(v || "").trim().slice(0, max);
+
 router.post("/", requireAuth, async (req, res) => {
   try {
-    const { customerName, customerPhone, address, items, total } = req.body || {};
-    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: "Cart is empty." });
-    if (typeof total !== "number") return res.status(400).json({ error: "Missing order total." });
+    const customerName = cleanText(req.body && req.body.customerName, 80);
+    const customerPhone = cleanText(req.body && req.body.customerPhone, 20);
+    const address = cleanText(req.body && req.body.address, 300);
+
+    let items, total;
+    try {
+      ({ items, total } = await priceOrderItems(req.body && req.body.items));
+    } catch (err) {
+      return res.status(err.status || 400).json({ error: err.message });
+    }
 
     const id = "ORD-" + Date.now().toString(36).toUpperCase() + crypto.randomBytes(2).toString("hex").toUpperCase();
     const dateKey = istDateKey();
@@ -376,7 +431,7 @@ router.get("/", requireAdmin, async (req, res) => {
   snap.forEach((doc) => orders.push(doc.data()));
   orders.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   const state = await getAdminDashboardState();
-  // Orders placed at or before the dashboard's clearedAt cutoff stay out
+   // Orders placed at or before the dashboard's clearedAt cutoff stay out
   // of the admin's view (they're still fully intact in Firestore, and
   // still visible to the customer on their own My Orders) until the admin
   // restores. See clearAdminDashboard() above for how the cutoff is set.
@@ -698,3 +753,4 @@ router.post("/clear-dashboard/undo", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
+     
