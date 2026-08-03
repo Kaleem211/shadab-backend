@@ -137,11 +137,14 @@ router.post("/signup/verify", async (req, res) => {
 
 router.post("/login", async (req, res) => {
   try {
-    const identifier = (req.body?.identifier || "").trim();
+    const email = (req.body?.identifier || req.body?.email || "").trim().toLowerCase();
     const password = req.body?.password || "";
-    if (!identifier || !password) return res.status(400).json({ error: "Enter your mobile/email and password." });
+    if (!email || !password) return res.status(400).json({ error: "Enter your college email and password." });
 
-    const user = isValidMobile(identifier) ? await findUserByMobile(identifier) : await findUserByEmail(identifier);
+    const emailCheck = validateCampusEmail(email);
+    if (!emailCheck.ok) return res.status(422).json({ error: emailCheck.error, code: emailCheck.code });
+
+    const user = await findUserByEmail(email);
     if (!user) return res.status(401).json({ error: "This account isn't registered. Check your details or create an account.", code: "invalid_credentials" });
 
     if (user.blocked) {
@@ -150,6 +153,7 @@ router.post("/login", async (req, res) => {
 
     const ok = await checkPassword(password, user.passwordHash);
     if (!ok) return res.status(401).json({ error: "Incorrect password. Please try again.", code: "invalid_credentials" });
+
 
     const token = signToken(user);
     res.json({ ok: true, token, user: { id: user.id, username: user.username, mobile: user.mobile, email: user.email } });
@@ -325,4 +329,4 @@ router.patch("/me", requireAuth, async (req, res) => {
 });
 
 module.exports = router;
-
+    
