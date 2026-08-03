@@ -778,6 +778,83 @@ router.post("/deliver-today/undo", requireAdmin, async (req, res) => {
    not a value frozen from when the order was placed. The front-end
    hides the Cancel button once that deadline passes, but this endpoint
    enforces it regardless of what the client sends. */
+/* Lets a customer edit their own still-editable order (items, delivery
+   address, contact number) — the counterpart to /:id/cancel below, and
+   gated by the exact same rules: only while the order hasn't been
+   delivered/cancelled/started ("preparing"), and only while today's
+   shared cancellation window is still open. That mirrors the frontend's
+   own gating for showing the "Edit order" button in the first place, but
+   this is what actually enforces it — this route did not exist before,
+   which is why every "Save changes" tap in the edit-order modal failed.
+   Items are re-priced from the live menu catalog exactly like order
+   creation does (priceOrderItems) — the client's own total is never
+   trusted. Since the total can change, reconcilePool runs afterward so
+   an edit that pushes the day's pool over (or back under) the minimum is
+   reflected immediately, for this order and every other order that day. */
+router.patch("/:id", requireAuth, async (req, res) => {
+  try {
+    const ref = ordersCol.doc(req.params.id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
+    const order = doc.data();
+    if (order.userMobile !== req.user.mobile) {
+      return res.status(403).json({ error: "You can only edit your own orders." });
+    }
+    if (order.status === "delivered") {
+      return res.status(400).json({ error: "This order has already been delivered and can't be edited." });
+    }
+    if (order.status === "cancelled") {
+      return res.status(400).json({ error: "This order is cancelled and can't be edited." });
+    }
+    if (order.status === "preparing") {
+      return res.status(400).json({ error: "The kitchen has already started preparing this order — it can't be edited anymore." });
+    }
+
+    const settings = await getSettings();
+    const window = getCancelWindow(order, settings);
+    const now = Date.now();
+    const fmt = (ms) => new Date(ms).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" });
+    if (window.opensAtMs && now < window.opensAtMs) {
+      return res.status(400).json({ error: `Editing opens at ${fmt(window.opensAtMs)} for today's orders.` });
+    }
+    if (now > window.closesAtMs) {
+      return res.status(400).json({ error: `The edit window for today's orders closed at ${fmt(window.closesAtMs)}.` });
+    }
+
+    let items, total;
+    try {
+      ({ items, total } = await priceOrderItems(req.body && req.body.items));
+    } catch (err) {
+      return res.status(err.status || 400).json({ error: err.message });
+    }
+
+    const address = cleanText(req.body && req.body.address, 300);
+    const phone = cleanText(req.body && req.body.phone, 20);
+    if (!address) {
+      return res.status(400).json({ error: "Please add a delivery address." });
+    }
+    if (!/^\d{10}$/.test(phone)) {
+      return res.status(400).json({ error: "Enter a valid 10-digit contact number." });
+    }
+
+    await ref.update({
+      items,
+      total,
+      address,
+      customerPhone: phone,
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (order.dateKey) await reconcilePool(order.dateKey, undefined, settings);
+
+    const freshDoc = await ref.get();
+    res.json({ ok: true, order: freshDoc.exists ? freshDoc.data() : order });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't save changes — try again." });
+  }
+});
+
 router.patch("/:id/cancel", requireAuth, async (req, res) => {
   try {
     const ref = ordersCol.doc(req.params.id);
