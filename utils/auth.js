@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const db = require("../db");
+const { getOrFetch } = require("./cache");
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const adminsCol = db.collection("admins");
@@ -31,8 +32,11 @@ async function requireAuth(req, res, next) {
   // extra lookup is what makes a block immediate for someone already
   // mid-session, not just for their next login attempt.
   try {
-    const doc = await usersCol.doc(identity.id).get();
-    if (doc.exists && doc.data().blocked) {
+    const blocked = await getOrFetch(`user-blocked-${identity.id}`, 30000, async () => {
+      const doc = await usersCol.doc(identity.id).get();
+      return doc.exists && !!doc.data().blocked;
+    });
+    if (blocked) {
       return res.status(403).json({ error: "This account has been blocked. Contact the restaurant if you think this is a mistake.", code: "account_blocked" });
     }
   } catch (err) {
