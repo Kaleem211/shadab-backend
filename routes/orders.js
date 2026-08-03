@@ -305,7 +305,55 @@ async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
     });
   }
 
-  return { total: activeTotal, minAmount: minPool, met, deliveryArrivedAt };
+  const result = { total: activeTotal, minAmount: minPool, met, deliveryArrivedAt };
+  maybeNotifyPoolFailure(dateKey, settings, result).catch((err) => console.error("Pool-failure check failed:", err));
+  return result;
+}
+
+/* If today's minimum order pool STILL hasn't been reached once the day's
+   ordering deadline (closing time + extra/grace time) has passed, every
+   customer with a still-"held" (pending) order today is notified that
+   the restaurant can't deliver today — instead of their order just
+   silently sitting at "Pending" forever with no explanation.
+
+   Fires at most once per day: the moment it fires, `poolFailedAt` is
+   stamped on that day's pool doc, and every later call short-circuits on
+   that flag so nobody gets the same notification twice. Never touches
+   order status — the admin can decide what to do with the held orders
+   (e.g. contact those customers) with the full picture still intact.
+   Safe to call as often as reconcilePool itself is called. */
+async function maybeNotifyPoolFailure(dateKey, settings, poolState) {
+  try {
+    if (poolState.met) return;
+    const closingTime = settings.closingTime || DEFAULT_CLOSING_TIME;
+    const graceMinutes = Number.isFinite(Number(settings.graceMinutes)) ? Number(settings.graceMinutes) : DEFAULT_GRACE_MIN;
+    const deadlineMs = new Date(`${dateKey}T${closingTime}:00+05:30`).getTime() + graceMinutes * 60 * 1000;
+    if (Date.now() < deadlineMs) return;
+
+    const poolRef = poolsCol.doc(dateKey);
+    const poolSnap = await poolRef.get();
+    const pool = poolSnap.exists ? poolSnap.data() : {};
+    if (pool.poolFailedAt) return; // already notified for today
+
+    const now = new Date().toISOString();
+    // Stamp first (before sending) so two near-simultaneous callers
+    // (e.g. two customers polling at once) can't both slip through and
+    // double-send the notification.
+    await poolRef.set({ dateKey, poolFailedAt: now }, { merge: true });
+
+    const snap = await ordersCol.where("dateKey", "==", dateKey).where("status", "==", "held").get();
+    snap.forEach((doc) => {
+      const o = doc.data();
+      notifyCustomer(o.userMobile, {
+        title: "😞 Sorry, today's order pool wasn't reached",
+        body: `Today's minimum order pool of ₹${poolState.minAmount} wasn't reached in time, so the restaurant can't deliver today. Sorry for the inconvenience!`,
+        tag: `pool-failed-${dateKey}`,
+        url: "/#orders",
+      }).catch((err) => console.error("Pool-failed push failed:", err));
+    });
+  } catch (err) {
+    console.error("maybeNotifyPoolFailure failed:", err);
+  }
 }
 
 /* Rebuilds the order's items/total from the server's own menu catalog
@@ -430,6 +478,7 @@ router.get("/pool-status", async (req, res) => {
     const dateKey = istDateKey();
     const settings = await getSettings();
     const pool = await reconcilePool(dateKey, settings.minOrderPoolAmount, settings);
+    const poolDoc = await poolsCol.doc(dateKey).get();
     res.json({
       ok: true,
       dateKey,
@@ -438,6 +487,7 @@ router.get("/pool-status", async (req, res) => {
       met: pool.met,
       remaining: Math.max(0, pool.minAmount - pool.total),
       deliveryArrivedAt: pool.deliveryArrivedAt || null,
+      poolFailedAt: (poolDoc.exists && poolDoc.data().poolFailedAt) || null,
     });
   } catch (err) {
     console.error(err);
@@ -493,10 +543,12 @@ router.get("/", requireAdmin, async (req, res) => {
   const visibleTodayTotal = visible
     .filter((o) => o.status !== "cancelled" && (o.dateKey || dateKey) === dateKey)
     .reduce((sum, o) => sum + (o.total || 0), 0);
+  const poolDocForBanner = await poolsCol.doc(dateKey).get();
   const adminPool = {
     total: visibleTodayTotal,
     minAmount: settings.minOrderPoolAmount,
     met: visibleTodayTotal >= settings.minOrderPoolAmount,
+    poolFailedAt: (poolDocForBanner.exists && poolDocForBanner.data().poolFailedAt) || null,
   };
 
   res.json({ ok: true, orders: visible, dashboardClearedAt: state.clearedAt, canRestore: !!state.clearedAt, adminPool });

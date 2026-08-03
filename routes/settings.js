@@ -143,9 +143,12 @@ router.put("/", requireAdmin, async (req, res) => {
   }
 });
 
+/* Superseded by POST /admins/password/central and POST /admins/password/local
+   (see routes/admins.js) — kept only so an older cached client hitting this
+   URL gets pointed somewhere useful instead of a confusing 404. */
 router.post("/admin-password", requireAdmin, (req, res) => {
   res.status(400).json({
-    error: "To change the admin password, update the ADMIN_PASSWORD environment variable in your Render dashboard (Settings → Environment) and redeploy. It can't be changed from here for security — it's never stored in the website's code.",
+    error: "Change the admin password from Settings → Change Central Password / Change Local Admin Password.",
   });
 });
 
