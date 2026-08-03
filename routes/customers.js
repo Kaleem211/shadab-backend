@@ -1,6 +1,7 @@
 const express = require("express");
 const db = require("../db");
 const { requireAdmin } = require("../utils/auth");
+const { invalidate } = require("../utils/cache");
 
 const router = express.Router();
 const usersCol = db.collection("users");
@@ -156,6 +157,7 @@ router.patch("/:id/block", requireAdmin, async (req, res) => {
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ error: "Customer not found." });
     await ref.update({ blocked: true, blockedAt: new Date().toISOString(), blockedBy: req.user.mobile });
+    invalidate(`user-blocked-${req.params.id}`);
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -169,6 +171,7 @@ router.patch("/:id/unblock", requireAdmin, async (req, res) => {
     const doc = await ref.get();
     if (!doc.exists) return res.status(404).json({ error: "Customer not found." });
     await ref.update({ blocked: false, blockedAt: null, blockedBy: null });
+    invalidate(`user-blocked-${req.params.id}`);
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -220,4 +223,3 @@ router.delete("/:id", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
-       
