@@ -1,6 +1,7 @@
 const express = require("express");
 const db = require("../db");
 const { requireAdmin } = require("../utils/auth");
+const { getOrFetch, invalidate } = require("../utils/cache");
 
 const router = express.Router();
 
@@ -57,7 +58,7 @@ const ALLOWED_KEYS = [
    sees the admin's current settings — not something cached per-device. */
 router.get("/", async (req, res) => {
   try {
-    const doc = await settingsDoc.get();
+    const doc = await getOrFetch("settings-doc", 10000, () => settingsDoc.get());
     const saved = doc.exists ? doc.data() : {};
     res.json({ ok: true, settings: { ...DEFAULTS, ...saved } });
   } catch (err) {
@@ -133,6 +134,7 @@ router.put("/", requireAdmin, async (req, res) => {
     }
 
     await settingsDoc.set(updates, { merge: true });
+    invalidate("settings-doc");
     const doc = await settingsDoc.get();
     res.json({ ok: true, settings: { ...DEFAULTS, ...doc.data() } });
   } catch (err) {
