@@ -4,6 +4,7 @@ const db = require("../db");
 const { requireAuth, requireAdmin } = require("../utils/auth");
 const { getOrderableMenu } = require("../utils/menuCatalog");
 const { getOrFetch, invalidate } = require("../utils/cache");
+const { notifyCustomer, notifyAllAdmins } = require("../utils/push");
 
 const router = express.Router();
 const ordersCol = db.collection("orders");
@@ -260,8 +261,18 @@ async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
       })
     );
     await batch.commit();
+    if (met) {
+      toFlip.forEach((doc) => {
+        const o = doc.data();
+        notifyCustomer(o.userMobile, {
+          title: "Order confirmed! 🎉",
+          body: `Your order ${o.id} is confirmed — the kitchen will start soon.`,
+          tag: `order-${o.id}`,
+          url: "/#orders",
+        }).catch((err) => console.error("Confirm push failed:", err));
+      });
+    }
   }
-
   // Auto-promote "confirmed" -> "preparing" the moment an order's own
   // cancellation window has closed, instead of waiting on the admin to flip
   // it by hand. This is what makes the customer-facing progress tracker
@@ -283,6 +294,15 @@ async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
     const batch = db.batch();
     toPromote.forEach((doc) => batch.update(doc.ref, { status: "preparing", preparingAt: nowIso }));
     await batch.commit();
+    toPromote.forEach((doc) => {
+      const o = doc.data();
+      notifyCustomer(o.userMobile, {
+        title: "Your order is being prepared 👨‍🍳",
+        body: `Order ${o.id} has started cooking — get ready!`,
+        tag: `order-${o.id}`,
+        url: "/#orders",
+      }).catch((err) => console.error("Preparing push failed:", err));
+    });
   }
 
   return { total: activeTotal, minAmount: minPool, met, deliveryArrivedAt };
@@ -386,6 +406,13 @@ router.post("/", requireAuth, async (req, res) => {
     await ordersCol.doc(id).set(order);
     await reconcilePool(dateKey, settings.minOrderPoolAmount, settings);
     const freshDoc = await ordersCol.doc(id).get();
+
+    notifyAllAdmins({
+      title: "New order 🧾",
+      body: `${order.customerName} — ₹${order.total} (${items.reduce((s, i) => s + i.qty, 0)} item${items.length > 1 ? "s" : ""})`,
+      tag: "new-order",
+      url: "/#admin",
+    }).catch((err) => console.error("Admin new-order push failed:", err));
 
     res.json({ ok: true, order: freshDoc.exists ? freshDoc.data() : order });
   } catch (err) {
@@ -509,6 +536,11 @@ router.patch("/:id/status", requireAdmin, async (req, res) => {
   if (status === "delivered") update.preDeliveryStatus = current;
   await ref.update(update);
   if (status === "delivered") await maybeAutoClearDashboard();
+  const o = doc.data();
+  notifyCustomer(o.userMobile, status === "delivered"
+    ? { title: "Order arrived! ✅", body: `Your order ${o.id} has been delivered. Enjoy your meal!`, tag: `order-${o.id}`, url: "/#orders" }
+    : { title: "Your order is being prepared 👨‍🍳", body: `Order ${o.id} has started cooking — get ready!`, tag: `order-${o.id}`, url: "/#orders" }
+  ).catch((err) => console.error("Status push failed:", err));
   res.json({ ok: true });
 });
 
@@ -527,6 +559,13 @@ router.patch("/:id/deliver", requireAdmin, async (req, res) => {
   }
   await ref.update({ status: "delivered", deliveredAt: new Date().toISOString(), preDeliveryStatus: current });
   await maybeAutoClearDashboard();
+  const o = doc.data();
+  notifyCustomer(o.userMobile, {
+    title: "Order arrived! ✅",
+    body: `Your order ${o.id} has been delivered. Enjoy your meal!`,
+    tag: `order-${o.id}`,
+    url: "/#orders",
+  }).catch((err) => console.error("Delivered push failed:", err));
   res.json({ ok: true });
 });
 
@@ -593,6 +632,15 @@ router.post("/deliver-today", requireAdmin, async (req, res) => {
       const batch = db.batch();
       toDeliver.forEach((doc) => batch.update(doc.ref, { status: "delivered", deliveredAt: now }));
       await batch.commit();
+      toDeliver.forEach((doc) => {
+        const o = doc.data();
+        notifyCustomer(o.userMobile, {
+          title: "Order arrived! ✅",
+          body: `Your order ${o.id} has been delivered. Enjoy your meal!`,
+          tag: `order-${o.id}`,
+          url: "/#orders",
+        }).catch((err) => console.error("Deliver-today push failed:", err));
+      });
     }
 
     await poolsCol.doc(dateKey).set(
