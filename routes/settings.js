@@ -2,7 +2,7 @@ const express = require("express");
 const db = require("../db");
 const { requireAdmin } = require("../utils/auth");
 const { getOrFetch, invalidate } = require("../utils/cache");
-const { reconcileToday } = require("./orders");
+const { reconcileToday, invalidateTodayPoolCache } = require("./orders");
 
 const router = express.Router();
 
@@ -141,7 +141,10 @@ router.put("/", requireAdmin, async (req, res) => {
     // settings — otherwise a changed closing time/grace/cancel window
     // only took effect the next time someone happened to place, cancel,
     // or edit an order, which is what made order progress look "stuck"
-    // after a timing change until unrelated activity nudged it.
+    // after a timing change until unrelated activity nudged it. Must
+    // invalidate the short pool cache first (see orders.js) or this call
+    // could just hand back a snapshot computed under the OLD settings.
+    invalidateTodayPoolCache();
     reconcileToday().catch((err) => console.error("Post-settings reconcile failed:", err));
     res.json({ ok: true, settings: { ...DEFAULTS, ...doc.data() } });
   } catch (err) {

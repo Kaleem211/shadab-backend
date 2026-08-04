@@ -9,6 +9,20 @@ const { notifyCustomer, notifyAllAdmins } = require("../utils/push");
 const router = express.Router();
 const ordersCol = db.collection("orders");
 const poolsCol = db.collection("pools");
+// How long a reconcilePool() result is reused before a fresh Firestore read
+// happens for that day. reconcilePool used to run its full orders-collection
+// query + a Firestore transaction EVERY time it was called — and it's called
+// from a lot of places that overlap in the same few seconds: every open
+// customer tab's pool-status poll (every 20s), every open admin tab's
+// dashboard poll (every 20s), the server's own 20s background heartbeat, AND
+// again inside GET /mine and GET / (admin) for self-healing. During a busy
+// dinner window with several people on the site at once, that meant many
+// duplicate reads of the exact same data within the same few seconds — the
+// single biggest driver of Firestore read/write usage on the free plan. A
+// short cache collapses all of those into one real read per window, while
+// staying well under the 20s poll interval so nothing feels less live.
+const POOL_CACHE_TTL_MS = 8000;
+const poolCacheKey = (dateKey) => `pool-${dateKey}`;
 const settingsDoc = db.collection("settings").doc("config");
 // Single doc that tracks the ADMIN DASHBOARD's own "clear" cutoff — kept
 // completely separate from the `orders` collection itself. See
@@ -196,8 +210,16 @@ function getCancelWindow(order, settings) {
    fall back to pending if the batch that justified confirming them no
    longer holds up.
    Safe to call as often as needed — on every order placed, every
-   cancellation, and defensively on every pool-status read. */
-async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
+   cancellation, and defensively on every pool-status read.
+
+   NOT called directly — see reconcilePool() below, which wraps this in a
+   short cache. Every route that actually CHANGES orders for a dateKey
+   invalidates that cache right before calling reconcilePool(), so this
+   uncached version still always runs (and the result is always fresh)
+   immediately after a real order placement/cancellation/edit/admin action —
+   caching only ever collapses repeated READ-triggered calls (polling,
+   self-heal on GET /mine and GET /, the background heartbeat). */
+async function reconcilePoolUncached(dateKey, minPoolOverride, settingsOverride) {
   const settings = settingsOverride || (await getSettings());
   const minPool = typeof minPoolOverride === "number" ? minPoolOverride : settings.minOrderPoolAmount;
   const snap = await ordersCol.where("dateKey", "==", dateKey).get();
@@ -346,6 +368,43 @@ async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
   const result = { total: activeTotal, minAmount: minPool, met, deliveryArrivedAt };
   maybeNotifyPoolFailure(dateKey, settings, result).catch((err) => console.error("Pool-failure check failed:", err));
   return result;
+}
+
+// Tracks the moment each dateKey last did REAL (uncached) reconciliation
+// work, so callers like reconcileOpenDateKeys (below) can tell a genuine
+// fresh recompute apart from a cache hit that changed nothing — see
+// wasReconciledJustNow().
+const lastFreshReconcileAt = new Map(); // dateKey -> ms timestamp
+
+/* Cached entry point — see the comment on reconcilePoolUncached above.
+   Everything in the codebase should call THIS, not the uncached version
+   directly, except the invalidate-then-call pattern used right after a real
+   order mutation (see invalidatePool() below). */
+function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
+  return getOrFetch(poolCacheKey(dateKey), POOL_CACHE_TTL_MS, async () => {
+    const result = await reconcilePoolUncached(dateKey, minPoolOverride, settingsOverride);
+    lastFreshReconcileAt.set(dateKey, Date.now());
+    return result;
+  });
+}
+
+/* True only if reconcilePool(dateKey) just did real Firestore work (this
+   call, not served from cache) — i.e. something could plausibly have
+   changed. Used to skip a needless second full orders re-fetch in GET /mine
+   and admin GET / when reconciliation was actually just a cache hit and
+   nothing could have moved. */
+function wasReconciledJustNow(dateKey) {
+  const t = lastFreshReconcileAt.get(dateKey);
+  return !!t && Date.now() - t < 1500;
+}
+
+/* Call right before reconcilePool() in any route that just wrote to an
+   order for this dateKey, so that call sees the real fresh state instead of
+   a stale cached snapshot from up to POOL_CACHE_TTL_MS ago — e.g. a
+   customer whose order just crossed the pool minimum needs to see
+   "Confirmed" immediately, not up to 8s later. */
+function invalidatePool(dateKey) {
+  invalidate(poolCacheKey(dateKey));
 }
 
 /* If today's minimum order pool STILL hasn't been reached once the day's
@@ -513,6 +572,7 @@ router.post("/", requireAuth, async (req, res) => {
     };
 
     await ordersCol.doc(id).set(order);
+    invalidatePool(dateKey);
     await reconcilePool(dateKey, settings.minOrderPoolAmount, settings);
     const freshDoc = await ordersCol.doc(id).get();
 
@@ -570,14 +630,22 @@ async function reconcileOpenDateKeys(orders) {
   )];
   if (!dateKeys.length) return false;
   const settings = await getSettings();
+  // Only report "something might have changed, re-fetch" when at least one
+  // of these dateKeys actually did fresh reconciliation work just now — a
+  // pure cache hit (very common when several people are polling within the
+  // same few seconds of each other, exactly the busy-dinner-rush case)
+  // means nothing could have moved, so the caller's expensive full
+  // orders-collection re-fetch can be skipped safely.
+  let anyFresh = false;
   for (const dk of dateKeys) {
     try {
       await reconcilePool(dk, settings.minOrderPoolAmount, settings);
+      if (wasReconciledJustNow(dk)) anyFresh = true;
     } catch (err) {
       console.error("reconcileOpenDateKeys failed for", dk, err);
     }
   }
-  return true;
+  return anyFresh;
 }
 
 router.get("/mine", requireAuth, async (req, res) => {
@@ -816,6 +884,7 @@ router.post("/deliver-today", requireAdmin, async (req, res) => {
       { merge: true }
     );
 
+    invalidatePool(dateKey);
     await maybeAutoClearDashboard();
     res.json({ ok: true, deliveredCount: toDeliver.length, deliveryArrivedAt: now });
   } catch (err) {
@@ -874,6 +943,7 @@ router.post("/deliver-today/undo", requireAdmin, async (req, res) => {
     }
 
     await poolRef.set({ dateKey, deliveryArrivedAt: null, lastDeliveryBroadcast: null }, { merge: true });
+    invalidatePool(dateKey);
 
     res.json({ ok: true, revertedCount });
   } catch (err) {
@@ -930,7 +1000,10 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
     // should honestly reflect that instead of staying stuck on
     // "Confirmed". Orders already "preparing" or "delivered" are left
     // alone since the kitchen has already committed to them specifically.
-    if (order.dateKey) await reconcilePool(order.dateKey, undefined, settings);
+    if (order.dateKey) {
+      invalidatePool(order.dateKey);
+      await reconcilePool(order.dateKey, undefined, settings);
+    }
 
     res.json({ ok: true });
   } catch (err) {
@@ -968,7 +1041,10 @@ async function applyOrderEdit(doc, body, { isAdmin }) {
       throw Object.assign(new Error("Your order needs at least one item."), { status: 400 });
     }
     await doc.ref.update({ status: "cancelled", cancelledAt: new Date().toISOString() });
-    if (order.dateKey) await reconcilePool(order.dateKey);
+    if (order.dateKey) {
+      invalidatePool(order.dateKey);
+      await reconcilePool(order.dateKey);
+    }
     return { cancelled: true };
   }
 
@@ -991,7 +1067,10 @@ async function applyOrderEdit(doc, body, { isAdmin }) {
   }
 
   await doc.ref.update(update);
-  if (order.dateKey) await reconcilePool(order.dateKey);
+  if (order.dateKey) {
+    invalidatePool(order.dateKey);
+    await reconcilePool(order.dateKey);
+  }
   const fresh = await doc.ref.get();
   return { cancelled: false, order: fresh.data() };
 }
@@ -1106,6 +1185,7 @@ router.post("/admin-create", requireAdmin, async (req, res) => {
     };
 
     await ordersCol.doc(id).set(order);
+    invalidatePool(dateKey);
     await reconcilePool(dateKey, settings.minOrderPoolAmount, settings);
     const freshDoc = await ordersCol.doc(id).get();
     res.json({ ok: true, order: freshDoc.exists ? freshDoc.data() : order });
@@ -1158,4 +1238,12 @@ module.exports.reconcileToday = async function reconcileToday() {
   const dateKey = istDateKey();
   const settings = await getSettings();
   return reconcilePool(dateKey, settings.minOrderPoolAmount, settings);
+};
+/* Exposed for routes/settings.js: a settings change (closing time, grace
+   minutes, minimum pool amount) must take effect immediately, not up to
+   POOL_CACHE_TTL_MS later — so settings.js invalidates today's cached pool
+   result right before calling reconcileToday(), forcing that one call to
+   do a real fresh read/recompute under the new settings. */
+module.exports.invalidateTodayPoolCache = function invalidateTodayPoolCache() {
+  invalidatePool(istDateKey());
 };
