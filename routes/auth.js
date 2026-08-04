@@ -126,7 +126,7 @@ router.post("/signup/verify", async (req, res) => {
     });
     await otpsCol.doc(row.id).update({ consumed: true });
 
-    const user = { id: userRef.id, username, mobile, email };
+    const user = { id: userRef.id, username, mobile, email, photo: null };
     const token = signToken(user);
     res.json({ ok: true, token, user });
   } catch (err) {
@@ -156,7 +156,7 @@ router.post("/login", async (req, res) => {
 
 
     const token = signToken(user);
-    res.json({ ok: true, token, user: { id: user.id, username: user.username, mobile: user.mobile, email: user.email } });
+    res.json({ ok: true, token, user: { id: user.id, username: user.username, mobile: user.mobile, email: user.email, photo: user.photo || null } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Something went wrong logging you in." });
@@ -274,7 +274,7 @@ router.post("/reset-password", async (req, res) => {
       ok: true,
       message: "Password updated. You're logged in.",
       token,
-      user: user ? { id: user.id, username: user.username, mobile: user.mobile, email: user.email } : null,
+      user: user ? { id: user.id, username: user.username, mobile: user.mobile, email: user.email, photo: user.photo || null } : null,
     });
   } catch (err) {
     console.error(err);
@@ -307,7 +307,7 @@ router.post("/forgot-password/skip", async (req, res) => {
     await resetTokensCol.doc(resetToken).update({ used: true });
 
     const token = signToken(user);
-    res.json({ ok: true, token, user: { id: user.id, username: user.username, mobile: user.mobile, email: user.email } });
+    res.json({ ok: true, token, user: { id: user.id, username: user.username, mobile: user.mobile, email: user.email, photo: user.photo || null } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Couldn't complete verification." });
@@ -321,11 +321,104 @@ router.get("/me", requireAuth, async (req, res) => {
   res.json({ ok: true, user: { id: doc.id, ...user } });
 });
 
+/* Profile update — username, mobile, and photo are each independently
+   optional now. Previously this route unconditionally required and
+   validated `username`, so a request that only meant to change the
+   mobile number or photo (with no `username` field at all) always fell
+   through to "Enter a username." even though the user never touched
+   that field. Now each field is only validated/updated if it's actually
+   present in the request body, and the fresh user record (never the
+   password hash) is returned so the frontend can update its in-memory
+   copy without a second round trip. */
 router.patch("/me", requireAuth, async (req, res) => {
-  const { username } = req.body || {};
-  if (!username || !username.trim()) return res.status(400).json({ error: "Enter a username." });
-  await usersCol.doc(req.user.id).update({ username: username.trim() });
-  res.json({ ok: true });
+  try {
+    const { username, mobile, photoDataUrl } = req.body || {};
+    const updates = {};
+
+    if (username !== undefined) {
+      if (!username || !username.trim()) return res.status(400).json({ error: "Enter a username." });
+      updates.username = username.trim().slice(0, 60);
+    }
+
+    if (mobile !== undefined) {
+      if (!isValidMobile(mobile)) return res.status(400).json({ error: "Enter a valid 10-digit mobile number." });
+      if (mobile !== req.user.mobile) {
+        const existing = await findUserByMobile(mobile);
+        if (existing && existing.id !== req.user.id) {
+          return res.status(409).json({ error: "This mobile number is already linked to another account." });
+        }
+      }
+      updates.mobile = mobile;
+    }
+
+    if (photoDataUrl !== undefined) {
+      if (photoDataUrl === null || photoDataUrl === "") {
+        updates.photo = null;
+      } else {
+        if (typeof photoDataUrl !== "string" || !/^data:image\/(png|jpe?g|webp);base64,/.test(photoDataUrl)) {
+          return res.status(400).json({ error: "Photo must be a JPEG, PNG, or WEBP image." });
+        }
+        // ~2MB raw image cap, accounting for base64's ~33% size overhead.
+        if (photoDataUrl.length > 2.8 * 1024 * 1024) {
+          return res.status(400).json({ error: "Photo is too large. Please choose an image under 2MB." });
+        }
+        updates.photo = photoDataUrl;
+      }
+    }
+
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({ error: "Nothing to update." });
+    }
+
+    // The mobile number doubles as the login/lookup identifier, so treat
+    // changing it as security-sensitive: log it (who, from what, to what)
+    // even though we don't currently require re-entering the password for
+    // it, so there's at least an audit trail if an account is disputed.
+    if (updates.mobile) {
+      console.log(`[profile] user ${req.user.id} changed mobile ${req.user.mobile} -> ${updates.mobile}`);
+    }
+
+    await usersCol.doc(req.user.id).update(updates);
+    const doc = await usersCol.doc(req.user.id).get();
+    const { passwordHash, ...user } = doc.data();
+
+    // Mobile is embedded in the JWT itself, so if it changed, the old
+    // token's claims are now stale — issue a fresh one so the frontend's
+    // very next authenticated request (which reads req.user.mobile
+    // server-side, e.g. for orders) is consistent with what's on screen.
+    const token = updates.mobile ? signToken({ id: doc.id, ...user }) : undefined;
+
+    res.json({ ok: true, user: { id: doc.id, ...user }, token });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't update your profile. Please try again." });
+  }
+});
+
+/* Change password — verifies the current password before setting a new
+   one, same hashing path signup uses. */
+router.post("/me/password", requireAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: "Enter your current and new password." });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: "New password must be at least 6 characters." });
+    }
+    const doc = await usersCol.doc(req.user.id).get();
+    if (!doc.exists) return res.status(404).json({ error: "User not found." });
+    const user = doc.data();
+    const ok = await checkPassword(currentPassword, user.passwordHash);
+    if (!ok) return res.status(401).json({ error: "Current password is incorrect." });
+
+    const passwordHash = await hashPassword(newPassword);
+    await usersCol.doc(req.user.id).update({ passwordHash });
+    res.json({ ok: true, message: "Password updated." });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't update your password. Please try again." });
+  }
 });
 
 module.exports = router;

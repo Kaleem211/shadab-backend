@@ -75,5 +75,4 @@ router.delete("/", requireAdmin, async (req, res) => {
 
 module.exports = router;
 
-
-  
+              

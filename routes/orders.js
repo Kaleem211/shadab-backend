@@ -241,8 +241,13 @@ async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
   });
 
   const toFlip = activeOrders.filter((doc) => {
-    const status = doc.data().status;
-    return met ? status === "held" : status === "confirmed";
+    const o = doc.data();
+    if (met) return o.status === "held";
+    // pinnedConfirmed marks an admin-force-confirmed order (see
+    // POST /admin-create) — it must never get swept back down to "held"
+    // just because the day's pool total dipped, since the admin
+    // explicitly committed to it regardless of the pool.
+    return o.status === "confirmed" && !o.pinnedConfirmed;
   });
   if (toFlip.length) {
     // confirmedAt is stamped the moment an order actually crosses
@@ -402,6 +407,11 @@ async function priceOrderItems(rawItems) {
 // frontend's HTML-escaping so no single rendering context has to be the
 // only thing standing between this input and a security bug.
 const cleanText = (v, max) => String(v || "").trim().slice(0, max);
+// Looser than auth.js's isValidMobile — admin-entered orders may involve
+// numbers outside the strict 10-digit campus format (landlines, etc), so
+// this just guards against empty/garbage input rather than enforcing the
+// same shape as a login-identifying mobile number.
+const isValidPhoneish = (v) => /^[\d+\-\s()]{6,20}$/.test(String(v || "").trim());
 
 router.post("/", requireAuth, async (req, res) => {
   try {
@@ -778,83 +788,6 @@ router.post("/deliver-today/undo", requireAdmin, async (req, res) => {
    not a value frozen from when the order was placed. The front-end
    hides the Cancel button once that deadline passes, but this endpoint
    enforces it regardless of what the client sends. */
-/* Lets a customer edit their own still-editable order (items, delivery
-   address, contact number) — the counterpart to /:id/cancel below, and
-   gated by the exact same rules: only while the order hasn't been
-   delivered/cancelled/started ("preparing"), and only while today's
-   shared cancellation window is still open. That mirrors the frontend's
-   own gating for showing the "Edit order" button in the first place, but
-   this is what actually enforces it — this route did not exist before,
-   which is why every "Save changes" tap in the edit-order modal failed.
-   Items are re-priced from the live menu catalog exactly like order
-   creation does (priceOrderItems) — the client's own total is never
-   trusted. Since the total can change, reconcilePool runs afterward so
-   an edit that pushes the day's pool over (or back under) the minimum is
-   reflected immediately, for this order and every other order that day. */
-router.patch("/:id", requireAuth, async (req, res) => {
-  try {
-    const ref = ordersCol.doc(req.params.id);
-    const doc = await ref.get();
-    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
-    const order = doc.data();
-    if (order.userMobile !== req.user.mobile) {
-      return res.status(403).json({ error: "You can only edit your own orders." });
-    }
-    if (order.status === "delivered") {
-      return res.status(400).json({ error: "This order has already been delivered and can't be edited." });
-    }
-    if (order.status === "cancelled") {
-      return res.status(400).json({ error: "This order is cancelled and can't be edited." });
-    }
-    if (order.status === "preparing") {
-      return res.status(400).json({ error: "The kitchen has already started preparing this order — it can't be edited anymore." });
-    }
-
-    const settings = await getSettings();
-    const window = getCancelWindow(order, settings);
-    const now = Date.now();
-    const fmt = (ms) => new Date(ms).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" });
-    if (window.opensAtMs && now < window.opensAtMs) {
-      return res.status(400).json({ error: `Editing opens at ${fmt(window.opensAtMs)} for today's orders.` });
-    }
-    if (now > window.closesAtMs) {
-      return res.status(400).json({ error: `The edit window for today's orders closed at ${fmt(window.closesAtMs)}.` });
-    }
-
-    let items, total;
-    try {
-      ({ items, total } = await priceOrderItems(req.body && req.body.items));
-    } catch (err) {
-      return res.status(err.status || 400).json({ error: err.message });
-    }
-
-    const address = cleanText(req.body && req.body.address, 300);
-    const phone = cleanText(req.body && req.body.phone, 20);
-    if (!address) {
-      return res.status(400).json({ error: "Please add a delivery address." });
-    }
-    if (!/^\d{10}$/.test(phone)) {
-      return res.status(400).json({ error: "Enter a valid 10-digit contact number." });
-    }
-
-    await ref.update({
-      items,
-      total,
-      address,
-      customerPhone: phone,
-      updatedAt: new Date().toISOString(),
-    });
-
-    if (order.dateKey) await reconcilePool(order.dateKey, undefined, settings);
-
-    const freshDoc = await ref.get();
-    res.json({ ok: true, order: freshDoc.exists ? freshDoc.data() : order });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Couldn't save changes — try again." });
-  }
-});
-
 router.patch("/:id/cancel", requireAuth, async (req, res) => {
   try {
     const ref = ordersCol.doc(req.params.id);
@@ -901,6 +834,182 @@ router.patch("/:id/cancel", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Couldn't cancel the order." });
+  }
+});
+
+/* Shared body of a "save changes" edit — used by both the customer's own
+   PATCH /:id and the admin's PATCH /:id/admin-edit below, so the two
+   never drift into two different copies of the same pricing/validation
+   logic. Re-prices items server-side exactly like POST / does (never
+   trusts a client-sent total), and supports the same "no items left ->
+   cancel instead" flow the edit-order UI offers. Returns
+   { cancelled: true } or { cancelled: false, order }. Throws
+   { status, message } on any rejection — callers turn that into the
+   HTTP response. */
+async function applyOrderEdit(doc, body, { isAdmin }) {
+  const order = doc.data();
+  if (order.status === "delivered") {
+    throw Object.assign(new Error("This order has already been delivered and can't be edited."), { status: 400 });
+  }
+  if (order.status === "cancelled") {
+    throw Object.assign(new Error("This order is already cancelled."), { status: 400 });
+  }
+  if (!isAdmin && order.status === "preparing") {
+    throw Object.assign(new Error("The kitchen has already started preparing this order — it can't be edited anymore."), { status: 400 });
+  }
+
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  const cancelIfEmpty = !!body.cancelIfEmpty;
+
+  if (!rawItems.length) {
+    if (!cancelIfEmpty) {
+      throw Object.assign(new Error("Your order needs at least one item."), { status: 400 });
+    }
+    await doc.ref.update({ status: "cancelled", cancelledAt: new Date().toISOString() });
+    if (order.dateKey) await reconcilePool(order.dateKey);
+    return { cancelled: true };
+  }
+
+  let items, total;
+  try {
+    ({ items, total } = await priceOrderItems(rawItems));
+  } catch (err) {
+    throw Object.assign(new Error(err.message), { status: err.status || 400 });
+  }
+
+  // Only touch address/phone if the client actually sent that key — the
+  // edit-order UI keeps these collapsed behind a link and only includes
+  // them in the payload if the person opened it and changed something,
+  // so an untouched field must NOT get overwritten with an empty string.
+  const update = { items, total };
+  if (body.address !== undefined) update.address = cleanText(body.address, 300);
+  if (body.phone !== undefined) {
+    const phone = cleanText(body.phone, 20);
+    if (phone) update.customerPhone = phone;
+  }
+
+  await doc.ref.update(update);
+  if (order.dateKey) await reconcilePool(order.dateKey);
+  const fresh = await doc.ref.get();
+  return { cancelled: false, order: fresh.data() };
+}
+
+/* Customer edits their own already-placed order — same authorization
+   (must be the order's own customer) and same edit deadline as
+   PATCH /:id/cancel, so someone can't edit an order that's already past
+   its cancellation window (effectively already committed to the
+   kitchen's next batch decision). Supports { items, address, phone,
+   cancelIfEmpty }: emptying the cart and setting cancelIfEmpty cancels
+   the order in the same request instead of failing. */
+router.patch("/:id", requireAuth, async (req, res) => {
+  try {
+    const ref = ordersCol.doc(req.params.id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
+    const order = doc.data();
+    if (order.userMobile !== req.user.mobile) {
+      return res.status(403).json({ error: "You can only edit your own orders." });
+    }
+
+    const settings = await getSettings();
+    const window = getCancelWindow(order, settings);
+    const now = Date.now();
+    const fmt = (ms) => new Date(ms).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" });
+    if (window.opensAtMs && now < window.opensAtMs) {
+      return res.status(400).json({ error: `Editing opens at ${fmt(window.opensAtMs)} for today's orders.` });
+    }
+    if (now > window.closesAtMs) {
+      return res.status(400).json({ error: `The edit window for today's orders closed at ${fmt(window.closesAtMs)}.` });
+    }
+
+    const result = await applyOrderEdit(doc, req.body || {}, { isAdmin: false });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: "Couldn't save changes to the order." });
+  }
+});
+
+/* Admin edits ANY order — no ownership or edit-window restriction, since
+   the admin is the one operating the kitchen. Reuses the exact same
+   pricing/validation as the customer-facing edit above. */
+router.patch("/:id/admin-edit", requireAdmin, async (req, res) => {
+  try {
+    const ref = ordersCol.doc(req.params.id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
+    const result = await applyOrderEdit(doc, req.body || {}, { isAdmin: true });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: "Couldn't save changes to the order." });
+  }
+});
+
+/* Admin creates an order on a customer's behalf (phone orders, walk-ins,
+   fixing a botched checkout, etc). `forceConfirmed: true` skips the
+   pool-minimum wait entirely and locks the order at "confirmed" via
+   pinnedConfirmed, so it's immune to being swept back to "held" by
+   reconcilePool if the day's pool total is later under the minimum (see
+   the toFlip filter above) — the admin has explicitly committed to
+   cooking it regardless. Without forceConfirmed, the order is created
+   exactly like a normal customer order (starts "held", reconciled
+   against the live pool total same as always). */
+router.post("/admin-create", requireAdmin, async (req, res) => {
+  try {
+    const customerName = cleanText(req.body && req.body.customerName, 80);
+    const customerPhone = cleanText(req.body && req.body.customerPhone, 20);
+    const address = cleanText(req.body && req.body.address, 300);
+    const forceConfirmed = !!(req.body && req.body.forceConfirmed);
+
+    if (!customerName) return res.status(400).json({ error: "Enter the customer's name." });
+    if (!isValidPhoneish(customerPhone)) return res.status(400).json({ error: "Enter a valid mobile number." });
+
+    let items, total;
+    try {
+      ({ items, total } = await priceOrderItems(req.body && req.body.items));
+    } catch (err) {
+      return res.status(err.status || 400).json({ error: err.message });
+    }
+
+    const id = "ORD-" + Date.now().toString(36).toUpperCase() + crypto.randomBytes(2).toString("hex").toUpperCase();
+    const dateKey = istDateKey();
+    const settings = await getSettings();
+    const now = new Date().toISOString();
+
+    const order = {
+      id,
+      userMobile: customerPhone,
+      customerName,
+      customerPhone,
+      address: address || "",
+      items,
+      total,
+      dateKey,
+      status: forceConfirmed ? "confirmed" : "held",
+      pinnedConfirmed: forceConfirmed,
+      confirmedAt: forceConfirmed ? now : null,
+      placedByAdmin: true,
+      deliveryWindowStart: settings.deliveryWindowStart,
+      deliveryWindowEnd: settings.deliveryWindowEnd,
+      closingTime: settings.closingTime,
+      graceMinutes: settings.graceMinutes,
+      cancelWindowMinutes: settings.cancelWindowMinutes,
+      cancellationMode: settings.cancellationMode,
+      cancelWindowStart: settings.cancelWindowStart,
+      cancelWindowEnd: settings.cancelWindowEnd,
+      createdAt: now,
+    };
+
+    await ordersCol.doc(id).set(order);
+    await reconcilePool(dateKey, settings.minOrderPoolAmount, settings);
+    const freshDoc = await ordersCol.doc(id).get();
+    res.json({ ok: true, order: freshDoc.exists ? freshDoc.data() : order });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't create the order." });
   }
 });
 
