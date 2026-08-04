@@ -50,4 +50,3 @@ async function getOrderableMenu() {
 }
 
 module.exports = { BASE_MENU, getOrderableMenu };
-   

@@ -58,4 +58,3 @@ function validateCampusEmail(rawEmail) {
 }
 
 module.exports = { validateCampusEmail, ALLOWED_DOMAIN, OTHER_CAMPUS_DOMAINS };
-
