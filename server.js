@@ -12,7 +12,6 @@ const settingsRoutes = require("./routes/settings");
 const adminsRoutes = require("./routes/admins");
 const customersRoutes = require("./routes/customers");
 const pushRoutes = require("./routes/push");
-
 // Fail fast with a clear message if required secrets are missing.
 ["GMAIL_USER", "GMAIL_APP_PASSWORD", "JWT_SECRET", "ADMIN_PASSWORD"].forEach((k) => {
   if (!process.env[k]) {
@@ -69,4 +68,19 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Shadab backend listening on port ${PORT}`));
+
+/* Background heartbeat: reconciles today's pool/order statuses on a
+   timer, not just when a request happens to trigger it (order placed,
+   cancelled, edited, or a settings save). Without this, status changes
+   that are purely time-based — the pool minimum being reached without
+   anyone ordering again, or an order's cancel-window closing so it
+   should auto-promote to "preparing" — only ever fired whenever a poll
+   or another customer's action happened to reconcile that day, which is
+   what made order progress and its push notifications feel delayed or
+   "stuck" between traffic. 20s matches the frontend's own live-refresh
+   interval (LIVE_REFRESH_MS in app.js), so a status a customer sees
+   never lags more than about one poll cycle behind real time. */
+setInterval(() => {
+  orderRoutes.reconcileToday().catch((err) => console.error("Heartbeat reconcile failed:", err));
+}, 20000);
     
