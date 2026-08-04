@@ -297,7 +297,12 @@ async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
   if (toPromote.length) {
     const nowIso = new Date(now).toISOString();
     const batch = db.batch();
-    toPromote.forEach((doc) => batch.update(doc.ref, { status: "preparing", preparingAt: nowIso }));
+    // autoPreparing:true marks this as a system guess based on the
+    // current deadline, NOT a real "the kitchen has started cooking"
+    // commitment — see the revert block right below, which is what
+    // makes this safe to auto-trigger from a deadline that can itself
+    // still move if the admin changes settings again.
+    toPromote.forEach((doc) => batch.update(doc.ref, { status: "preparing", preparingAt: nowIso, autoPreparing: true }));
     await batch.commit();
     toPromote.forEach((doc) => {
       const o = doc.data();
@@ -308,6 +313,34 @@ async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
         url: "/#orders",
       }).catch((err) => console.error("Preparing push failed:", err));
     });
+  }
+
+  // Mirror image of the promotion above: if an order was auto-promoted to
+  // "preparing" purely because the live cancel-window deadline had
+  // passed, and the admin later moves that deadline back out (extending
+  // closing time, adding grace minutes, widening the cancel allowance —
+  // whether for real ordering-hours reasons or while testing settings),
+  // undo it back to "confirmed". This is the fix for orders getting
+  // permanently "stuck" at Preparing after an admin changed the time
+  // and then changed it back.
+  //
+  // Never touches an order the admin put into "preparing" by hand via
+  // PATCH /:id/status — that route deliberately does NOT set
+  // autoPreparing, because a human confirming the kitchen actually
+  // started cooking is a real-world fact that a later settings tweak
+  // must never silently reverse.
+  const toRevertPreparing = activeOrders.filter((doc) => {
+    const o = doc.data();
+    if (o.status !== "preparing" || !o.autoPreparing) return false;
+    const window = getCancelWindow(o, settings);
+    return now <= window.closesAtMs;
+  });
+  if (toRevertPreparing.length) {
+    const batch = db.batch();
+    toRevertPreparing.forEach((doc) =>
+      batch.update(doc.ref, { status: "confirmed", preparingAt: null, autoPreparing: false })
+    );
+    await batch.commit();
   }
 
   const result = { total: activeTotal, minAmount: minPool, met, deliveryArrivedAt };
@@ -505,10 +538,42 @@ router.get("/pool-status", async (req, res) => {
   }
 });
 
+/* Best-effort helper: reconciles every DISTINCT dateKey found among a set
+   of still-open orders. Used by GET /mine and GET / (admin) so a normal
+   page load/poll self-heals status the same way an order placement or
+   cancellation always has — instead of a customer or admin only ever
+   seeing fresh statuses when SOMEONE ELSE happens to trigger a write
+   that day. This is what keeps the progress tracker moving (both
+   forward and back) as the admin adjusts closing time/grace/cancel
+   settings, without needing anyone to place or cancel an order first. */
+async function reconcileOpenDateKeys(orders) {
+  const dateKeys = [...new Set(
+    orders.filter((o) => !["cancelled", "delivered"].includes(o.status) && o.dateKey).map((o) => o.dateKey)
+  )];
+  if (!dateKeys.length) return false;
+  const settings = await getSettings();
+  for (const dk of dateKeys) {
+    try {
+      await reconcilePool(dk, settings.minOrderPoolAmount, settings);
+    } catch (err) {
+      console.error("reconcileOpenDateKeys failed for", dk, err);
+    }
+  }
+  return true;
+}
+
 router.get("/mine", requireAuth, async (req, res) => {
   const snap = await ordersCol.where("userMobile", "==", req.user.mobile).get();
-  const orders = [];
+  let orders = [];
   snap.forEach((doc) => orders.push(doc.data()));
+  if (await reconcileOpenDateKeys(orders)) {
+    // Re-fetch so the response reflects any status flips reconciliation
+    // just made (held<->confirmed, confirmed<->preparing) rather than
+    // the pre-reconciliation snapshot we already had in memory.
+    const fresh = await ordersCol.where("userMobile", "==", req.user.mobile).get();
+    orders = [];
+    fresh.forEach((doc) => orders.push(doc.data()));
+  }
   orders.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
   res.json({ ok: true, orders });
 });
@@ -530,8 +595,21 @@ router.get("/", requireAdmin, async (req, res) => {
   const snap = state.clearedAt
     ? await ordersCol.where("createdAt", ">", state.clearedAt).get()
     : await ordersCol.get();
-  const visible = [];
+  let visible = [];
   snap.forEach((doc) => visible.push(doc.data()));
+
+  // Same self-healing reconciliation as GET /mine — an admin's dashboard
+  // poll should never show a "Confirmed" order that should have flipped
+  // back to "Pending" (or a "Preparing" order stuck from before a
+  // settings change), just because nobody happened to place or cancel
+  // an order since. Re-fetch afterward so this response reflects it.
+  if (await reconcileOpenDateKeys(visible)) {
+    const fresh = state.clearedAt
+      ? await ordersCol.where("createdAt", ">", state.clearedAt).get()
+      : await ordersCol.get();
+    visible = [];
+    fresh.forEach((doc) => visible.push(doc.data()));
+  }
   visible.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 
   // The admin dashboard's pool banner used to always show the real,
@@ -592,6 +670,12 @@ router.patch("/:id/status", requireAdmin, async (req, res) => {
     return res.status(400).json({ error: `Can't mark delivered from '${current}'.` });
   }
   const update = { status, [`${status}At`]: new Date().toISOString() };
+  // A human admin explicitly moving this order to "preparing" is a real
+  // commitment ("the kitchen has started cooking it") — not the system's
+  // deadline-based guess. autoPreparing:false marks it as locked, so a
+  // later settings change can never auto-revert it back to "confirmed"
+  // (see the toRevertPreparing check in reconcilePool above).
+  if (status === "preparing") update.autoPreparing = false;
   // Remember exactly what the order was before it became "delivered" so a
   // single per-order "undeliver" (PATCH /:id/undeliver below) can restore
   // it honestly instead of guessing "confirmed" for every case.
@@ -1047,3 +1131,13 @@ router.post("/clear-dashboard/undo", requireAdmin, async (req, res) => {
 });
 
 module.exports = router;
+/* Exposed for routes/settings.js (reconcile immediately after a settings
+   change, so a new closing time/grace/cancel-window takes effect right
+   away) and for server.js's background heartbeat (see there for why a
+   periodic timer, not just request-triggered reconciliation, is needed
+   for timely status changes and push notifications). */
+module.exports.reconcileToday = async function reconcileToday() {
+  const dateKey = istDateKey();
+  const settings = await getSettings();
+  return reconcilePool(dateKey, settings.minOrderPoolAmount, settings);
+};
