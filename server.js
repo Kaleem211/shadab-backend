@@ -77,10 +77,20 @@ app.listen(PORT, () => console.log(`Shadab backend listening on port ${PORT}`));
    should auto-promote to "preparing" — only ever fired whenever a poll
    or another customer's action happened to reconcile that day, which is
    what made order progress and its push notifications feel delayed or
-   "stuck" between traffic. 20s matches the frontend's own live-refresh
-   interval (LIVE_REFRESH_MS in app.js), so a status a customer sees
-   never lags more than about one poll cycle behind real time. */
+   "stuck" between traffic.
+
+   60s here (rather than matching the frontend's own 20s live-refresh
+   interval) is deliberate: reconcilePool() now caches its result for a
+   few seconds (see routes/orders.js), so while anyone is actually on the
+   site their own polling keeps things fresh far more often than this timer
+   does anyway. This heartbeat's only real job is covering the gap when
+   NO ONE is browsing — e.g. a status that should auto-promote overnight
+   with zero visitors — so it doesn't need to run every 20s and burn a
+   guaranteed Firestore read four times a minute, 24/7, on the free plan's
+   daily quota for no one's benefit. Worst-case lag when the site is quiet
+   is under a minute, which is a non-issue since there's no one there to
+   perceive it. */
 setInterval(() => {
   orderRoutes.reconcileToday().catch((err) => console.error("Heartbeat reconcile failed:", err));
-}, 20000);
+}, 60000);
     
