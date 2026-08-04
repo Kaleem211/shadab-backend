@@ -354,24 +354,42 @@ async function reconcilePool(dateKey, minPoolOverride, settingsOverride) {
    the restaurant can't deliver today — instead of their order just
    silently sitting at "Pending" forever with no explanation.
 
-   Fires at most once per day: the moment it fires, `poolFailedAt` is
+   Fires at most once per deadline: the moment it fires, `poolFailedAt` is
    stamped on that day's pool doc, and every later call short-circuits on
    that flag so nobody gets the same notification twice. Never touches
    order status — the admin can decide what to do with the held orders
    (e.g. contact those customers) with the full picture still intact.
-   Safe to call as often as reconcilePool itself is called. */
+   Safe to call as often as reconcilePool itself is called.
+
+   IMPORTANT — self-healing against a moved deadline: the deadline is
+   always recomputed live from the CURRENT settings, never frozen. If the
+   admin pushes closing time later (or adds grace) after a failure was
+   already stamped for today, the new deadline lands back in the future,
+   and this clears the stale `poolFailedAt` flag automatically instead of
+   leaving the "kitchen batch didn't go ahead" banner stuck showing for
+   the rest of the day. That's also why this runs unconditionally (not
+   just when the pool is unmet) — it needs to see and clear a stale flag
+   even on a call where the pool happens to be met. */
 async function maybeNotifyPoolFailure(dateKey, settings, poolState) {
   try {
-    if (poolState.met) return;
     const closingTime = settings.closingTime || DEFAULT_CLOSING_TIME;
     const graceMinutes = Number.isFinite(Number(settings.graceMinutes)) ? Number(settings.graceMinutes) : DEFAULT_GRACE_MIN;
     const deadlineMs = new Date(`${dateKey}T${closingTime}:00+05:30`).getTime() + graceMinutes * 60 * 1000;
-    if (Date.now() < deadlineMs) return;
 
     const poolRef = poolsCol.doc(dateKey);
     const poolSnap = await poolRef.get();
     const pool = poolSnap.exists ? poolSnap.data() : {};
-    if (pool.poolFailedAt) return; // already notified for today
+
+    // Deadline hasn't (yet, or any longer) passed, or the pool is now
+    // met — nothing should be flagged as failed right now. If an old
+    // flag is still sitting there from a since-moved deadline, clear it
+    // so the website banner and admin dashboard go back to "still open".
+    if (poolState.met || Date.now() < deadlineMs) {
+      if (pool.poolFailedAt) await poolRef.set({ poolFailedAt: null }, { merge: true });
+      return;
+    }
+
+    if (pool.poolFailedAt) return; // already notified for this deadline
 
     const now = new Date().toISOString();
     // Stamp first (before sending) so two near-simultaneous callers
