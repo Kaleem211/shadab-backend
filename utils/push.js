@@ -48,9 +48,20 @@ async function sendOne(subscription, payload) {
     await webpush.sendNotification(subscription, JSON.stringify(payload));
     return true;
   } catch (err) {
-    if (err.statusCode === 404 || err.statusCode === 410) return false;
+    // 404/410 = the push service says the subscription itself is gone
+    // (uninstalled, permission revoked, etc). 403/400 here almost always
+    // means a VAPID key mismatch — the subscription was created against a
+    // DIFFERENT public key than the one this server is currently signing
+    // with (e.g. the keys were regenerated after someone already
+    // subscribed). That's not transient: every future send against it
+    // will keep failing the exact same way forever, so it's pruned here
+    // too instead of being retried indefinitely. The frontend's subscribe()
+    // now detects this key mismatch and creates a fresh subscription, so
+    // pruning the dead one here just lets that replacement take over
+    // cleanly instead of both existing side by side.
+    if ([404, 410, 403, 400].includes(err.statusCode)) return false;
     console.error("Push send failed:", err.statusCode || err.message);
-    return true; // transient failure (network, rate limit) — keep the subscription
+    return true; // genuinely transient failure (network, rate limit) — keep the subscription
   }
 }
 
