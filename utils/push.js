@@ -73,7 +73,15 @@ async function sendOne(subscription, payload) {
     // now detects this key mismatch and creates a fresh subscription, so
     // pruning the dead one here just lets that replacement take over
     // cleanly instead of both existing side by side.
-    if ([404, 410, 403, 400].includes(err.statusCode)) return false;
+    if ([404, 410, 403, 400].includes(err.statusCode)) {
+      // Logged even though the subscription is being pruned — without this,
+      // "sent to 0/1" in the server log gives no way to tell a genuinely
+      // uninstalled device (404/410) apart from a VAPID key mismatch
+      // (403/400, meaning the frontend's stale-key detection missed it and
+      // the subscription needs a real user visit to regenerate).
+      console.warn(`Push send failed permanently (${err.statusCode}) — pruning subscription. Endpoint: ${(subscription.endpoint || "").slice(0, 60)}…`);
+      return false;
+    }
     console.error("Push send failed:", err.statusCode || err.message);
     return true; // genuinely transient failure (network, rate limit) — keep the subscription
   }
