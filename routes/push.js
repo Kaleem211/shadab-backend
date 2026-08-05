@@ -30,6 +30,7 @@ router.post("/subscribe-customer", requireAuth, async (req, res) => {
     const deduped = existing.filter((s) => s.endpoint !== subscription.endpoint);
     deduped.push(subscription);
     await ref.set({ pushSubscriptions: deduped }, { merge: true });
+    console.log(`[push] subscribe-customer: saved for user ${req.user.id} (mobile ${req.user.mobile}) — now ${deduped.length} device(s)`);
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -64,6 +65,7 @@ router.post("/subscribe-admin", requireAdmin, async (req, res) => {
   try {
     const key = endpointKey(subscription.endpoint);
     await adminSubsCol.doc(key).set({ subscription, savedAt: new Date().toISOString() });
+    console.log(`[push] subscribe-admin: saved device ${key.slice(0, 8)}…`);
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
