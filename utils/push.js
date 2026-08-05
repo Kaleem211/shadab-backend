@@ -41,6 +41,20 @@ function endpointKey(endpoint) {
   return crypto.createHash("sha256").update(endpoint).digest("hex");
 }
 
+/* Turns an order's item list into a short, readable phrase for push
+   notifications — e.g. "Chicken Biryani", "Chicken Biryani x2",
+   "Chicken Biryani & Paneer Tikka", or "Chicken Biryani & 2 more items" —
+   instead of a bare order id, which meant nothing to a customer glancing
+   at a notification. */
+function itemSummary(items) {
+  if (!Array.isArray(items) || !items.length) return "order";
+  const names = items.map((i) => (i.qty && i.qty > 1 ? `${i.name} x${i.qty}` : i.name));
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return `${names[0]} & ${names[1]}`;
+  const rest = names.length - 1;
+  return `${names[0]} & ${rest} more item${rest > 1 ? "s" : ""}`;
+}
+
 /* Returns true if the subscription is still good, false if the push
    service says it's gone and should be removed. */
 async function sendOne(subscription, payload) {
@@ -92,13 +106,19 @@ async function notifyCustomer(mobile, payload) {
 
 /**
  * Sends a notification to every device currently subscribed for admin
- * new-order alerts.
+ * new-order alerts — but ONLY devices that unlocked admin with the
+ * CENTRAL password. A device that unlocked with the local (per-session)
+ * password is deliberately excluded: local unlocks are meant for
+ * occasional/one-off access, not for being paged about every new order.
+ * Each subscription doc records which password unlocked it at
+ * subscribe-admin time (see routes/push.js), so this is a plain
+ * Firestore filter rather than anything computed here.
  */
 async function notifyAllAdmins(payload) {
   if (!configured) { console.log("[push] notifyAllAdmins skipped — VAPID not configured"); return; }
   try {
-    const snap = await adminSubsCol.get();
-    if (snap.empty) { console.log("[push] notifyAllAdmins: 0 admin devices subscribed"); return; }
+    const snap = await adminSubsCol.where("passwordType", "==", "central").get();
+    if (snap.empty) { console.log("[push] notifyAllAdmins: 0 central-admin devices subscribed"); return; }
     const dead = [];
     await Promise.all(
       snap.docs.map(async (doc) => {
@@ -106,7 +126,7 @@ async function notifyAllAdmins(payload) {
         if (!ok) dead.push(doc.ref);
       })
     );
-    console.log(`[push] notifyAllAdmins: sent to ${snap.size - dead.length}/${snap.size} admin device(s)`);
+    console.log(`[push] notifyAllAdmins: sent to ${snap.size - dead.length}/${snap.size} central-admin device(s)`);
     if (dead.length) {
       const batch = db.batch();
       dead.forEach((ref) => batch.delete(ref));
@@ -117,4 +137,4 @@ async function notifyAllAdmins(payload) {
   }
 }
 
-module.exports = { notifyCustomer, notifyAllAdmins, endpointKey, VAPID_PUBLIC, configured };
+module.exports = { notifyCustomer, notifyAllAdmins, itemSummary, endpointKey, VAPID_PUBLIC, configured };
