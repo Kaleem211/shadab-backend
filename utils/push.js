@@ -71,15 +71,17 @@ async function sendOne(subscription, payload) {
  * payload: { title, body, tag?, url? }
  */
 async function notifyCustomer(mobile, payload) {
-  if (!configured || !mobile) return;
+  if (!configured) { console.log("[push] notifyCustomer skipped — VAPID not configured"); return; }
+  if (!mobile) { console.log("[push] notifyCustomer skipped — no mobile number on this order"); return; }
   try {
     const snap = await usersCol.where("mobile", "==", mobile).limit(1).get();
-    if (snap.empty) return;
+    if (snap.empty) { console.log(`[push] notifyCustomer: no user doc found for mobile ${mobile}`); return; }
     const doc = snap.docs[0];
     const subs = doc.data().pushSubscriptions || [];
-    if (!subs.length) return;
+    if (!subs.length) { console.log(`[push] notifyCustomer: user ${mobile} has 0 saved subscriptions`); return; }
     const results = await Promise.all(subs.map((s) => sendOne(s, payload)));
     const stillGood = subs.filter((_, i) => results[i]);
+    console.log(`[push] notifyCustomer ${mobile}: sent to ${stillGood.length}/${subs.length} subscription(s)`);
     if (stillGood.length !== subs.length) {
       await doc.ref.update({ pushSubscriptions: stillGood });
     }
@@ -93,10 +95,10 @@ async function notifyCustomer(mobile, payload) {
  * new-order alerts.
  */
 async function notifyAllAdmins(payload) {
-  if (!configured) return;
+  if (!configured) { console.log("[push] notifyAllAdmins skipped — VAPID not configured"); return; }
   try {
     const snap = await adminSubsCol.get();
-    if (snap.empty) return;
+    if (snap.empty) { console.log("[push] notifyAllAdmins: 0 admin devices subscribed"); return; }
     const dead = [];
     await Promise.all(
       snap.docs.map(async (doc) => {
@@ -104,6 +106,7 @@ async function notifyAllAdmins(payload) {
         if (!ok) dead.push(doc.ref);
       })
     );
+    console.log(`[push] notifyAllAdmins: sent to ${snap.size - dead.length}/${snap.size} admin device(s)`);
     if (dead.length) {
       const batch = db.batch();
       dead.forEach((ref) => batch.delete(ref));
