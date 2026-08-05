@@ -139,10 +139,17 @@ router.post("/login", async (req, res) => {
   try {
     const email = (req.body?.identifier || req.body?.email || "").trim().toLowerCase();
     const password = req.body?.password || "";
-    if (!email || !password) return res.status(400).json({ error: "Enter your college email and password." });
+    if (!email || !password) return res.status(400).json({ error: "Enter your email and password." });
 
-    const emailCheck = validateCampusEmail(email);
-    if (!emailCheck.ok) return res.status(422).json({ error: emailCheck.error, code: emailCheck.code });
+    // Deliberately NOT gated by validateCampusEmail here. That check exists
+    // to control who can CREATE a new account (see /signup) — it has
+    // nothing to do with whether an email is registered. Some existing
+    // accounts were created before this restriction existed (or added
+    // directly by an admin) and use a personal email or another campus's
+    // domain; those are real, already-registered accounts and login must
+    // work for them exactly like any other. Only a basic shape check is
+    // needed here — the real gate is simply "does an account exist".
+    if (!isValidEmail(email)) return res.status(400).json({ error: "Enter a valid email address." });
 
     const user = await findUserByEmail(email);
     if (!user) return res.status(401).json({ error: "This account isn't registered. Check your details or create an account.", code: "invalid_credentials" });
@@ -167,10 +174,12 @@ router.post("/forgot-password", otpLimiter, async (req, res) => {
   try {
     const email = (req.body?.email || "").trim().toLowerCase();
 
-    // Same college-email policy as sign up, so this field can't be used
-    // to probe with arbitrary/malformed addresses.
-    const emailCheck = validateCampusEmail(email);
-    if (!emailCheck.ok) return res.status(422).json({ error: emailCheck.error, code: emailCheck.code });
+    // Same reasoning as /login above: password reset is for an account
+    // that already exists, so it isn't gated by the college-only signup
+    // policy — a personal-email or other-campus account that's already
+    // registered must be able to recover its own password. Only the
+    // account-existence check below actually gates this.
+    if (!isValidEmail(email)) return res.status(400).json({ error: "Enter a valid email address." });
 
     // NOTE (intentional product decision, not an oversight): this confirms
     // whether an account exists, which is a deliberate UX trade-off against
