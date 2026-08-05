@@ -81,6 +81,47 @@ router.post("/subscribe-admin", requireAdmin, async (req, res) => {
   }
 });
 
+/* Diagnostic — lets an admin check whether a given customer actually has
+   any live push subscriptions, without needing to read raw server logs.
+   GET /push/customer-status/:mobile */
+router.get("/customer-status/:mobile", requireAdmin, async (req, res) => {
+  try {
+    const mobile = req.params.mobile;
+    const snap = await usersCol.where("mobile", "==", mobile).limit(1).get();
+    if (snap.empty) return res.json({ found: false, mobile, subscriptionCount: 0 });
+    const data = snap.docs[0].data();
+    const subs = data.pushSubscriptions || [];
+    res.json({
+      found: true,
+      mobile,
+      username: data.username || null,
+      subscriptionCount: subs.length,
+      endpoints: subs.map((s) => (s.endpoint || "").slice(0, 60) + "…"),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't look up push status." });
+  }
+});
+
+/* Diagnostic — shows exactly how many admin devices are registered for
+   new-order alerts, split by which password unlocked them. notifyAllAdmins
+   ONLY pages devices in the "central" bucket, so if this comes back with
+   central: 0 that is, by itself, the entire explanation for "admin never
+   got the new-order alert" — no log-digging required.
+   GET /push/admin-status */
+router.get("/admin-status", requireAdmin, async (req, res) => {
+  try {
+    const snap = await adminSubsCol.get();
+    let central = 0, local = 0;
+    snap.forEach((doc) => { doc.data().passwordType === "central" ? central++ : local++; });
+    res.json({ totalDevices: snap.size, central, local, yourUnlockType: req.adminPasswordType });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't look up admin push status." });
+  }
+});
+
 router.post("/unsubscribe-admin", requireAdmin, async (req, res) => {
   const endpoint = req.body && req.body.endpoint;
   if (!endpoint) return res.status(400).json({ error: "Missing endpoint." });
