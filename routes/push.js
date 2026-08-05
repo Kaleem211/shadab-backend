@@ -64,8 +64,16 @@ router.post("/subscribe-admin", requireAdmin, async (req, res) => {
   }
   try {
     const key = endpointKey(subscription.endpoint);
-    await adminSubsCol.doc(key).set({ subscription, savedAt: new Date().toISOString() });
-    console.log(`[push] subscribe-admin: saved device ${key.slice(0, 8)}…`);
+    // req.adminPasswordType ("central" or "local") is set by requireAdmin
+    // based on which password unlocked THIS request. Stamping it onto the
+    // subscription is what lets notifyAllAdmins() later send new-order
+    // alerts only to devices unlocked with the central password.
+    await adminSubsCol.doc(key).set({
+      subscription,
+      passwordType: req.adminPasswordType || null,
+      savedAt: new Date().toISOString(),
+    });
+    console.log(`[push] subscribe-admin: saved device ${key.slice(0, 8)}… (${req.adminPasswordType || "unknown"} password)`);
     res.json({ ok: true });
   } catch (err) {
     console.error(err);

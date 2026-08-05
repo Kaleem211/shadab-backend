@@ -4,7 +4,7 @@ const db = require("../db");
 const { requireAuth, requireAdmin } = require("../utils/auth");
 const { getOrderableMenu } = require("../utils/menuCatalog");
 const { getOrFetch, invalidate } = require("../utils/cache");
-const { notifyCustomer, notifyAllAdmins } = require("../utils/push");
+const { notifyCustomer, notifyAllAdmins, itemSummary } = require("../utils/push");
 
 const router = express.Router();
 const ordersCol = db.collection("orders");
@@ -293,7 +293,7 @@ async function reconcilePoolUncached(dateKey, minPoolOverride, settingsOverride)
         const o = doc.data();
         notifyCustomer(o.userMobile, {
           title: "Order confirmed! 🎉",
-          body: `Your order ${o.id} is confirmed — the kitchen will start soon.`,
+          body: `Your ${itemSummary(o.items)} is confirmed! 🎉 The kitchen will start soon.`,
           tag: `order-${o.id}`,
           url: "/#orders",
         }).catch((err) => console.error("Confirm push failed:", err));
@@ -330,7 +330,7 @@ async function reconcilePoolUncached(dateKey, minPoolOverride, settingsOverride)
       const o = doc.data();
       notifyCustomer(o.userMobile, {
         title: "Your order is being prepared 👨‍🍳",
-        body: `Order ${o.id} has started cooking — get ready!`,
+        body: `Your ${itemSummary(o.items)} started preparing 👨‍🍳 — get ready to collect!`,
         tag: `order-${o.id}`,
         url: "/#orders",
       }).catch((err) => console.error("Preparing push failed:", err));
@@ -770,8 +770,8 @@ router.patch("/:id/status", requireAdmin, async (req, res) => {
   if (status === "delivered") await maybeAutoClearDashboard();
   const o = doc.data();
   notifyCustomer(o.userMobile, status === "delivered"
-    ? { title: "Order arrived! ✅", body: `Your order ${o.id} has been delivered. Enjoy your meal!`, tag: `order-${o.id}`, url: "/#orders" }
-    : { title: "Your order is being prepared 👨‍🍳", body: `Order ${o.id} has started cooking — get ready!`, tag: `order-${o.id}`, url: "/#orders" }
+    ? { title: "Order arrived! ✅", body: `Your ${itemSummary(o.items)} has arrived ✅ — pick up your order!`, tag: `order-${o.id}`, url: "/#orders" }
+    : { title: "Your order is being prepared 👨‍🍳", body: `Your ${itemSummary(o.items)} started preparing 👨‍🍳 — get ready to collect!`, tag: `order-${o.id}`, url: "/#orders" }
   ).catch((err) => console.error("Status push failed:", err));
   res.json({ ok: true });
 });
@@ -794,7 +794,7 @@ router.patch("/:id/deliver", requireAdmin, async (req, res) => {
   const o = doc.data();
   notifyCustomer(o.userMobile, {
     title: "Order arrived! ✅",
-    body: `Your order ${o.id} has been delivered. Enjoy your meal!`,
+    body: `Your ${itemSummary(o.items)} has arrived ✅ — pick up your order!`,
     tag: `order-${o.id}`,
     url: "/#orders",
   }).catch((err) => console.error("Delivered push failed:", err));
@@ -868,7 +868,7 @@ router.post("/deliver-today", requireAdmin, async (req, res) => {
         const o = doc.data();
         notifyCustomer(o.userMobile, {
           title: "Order arrived! ✅",
-          body: `Your order ${o.id} has been delivered. Enjoy your meal!`,
+          body: `Your ${itemSummary(o.items)} has arrived ✅ — pick up your order!`,
           tag: `order-${o.id}`,
           url: "/#orders",
         }).catch((err) => console.error("Deliver-today push failed:", err));
