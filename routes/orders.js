@@ -125,6 +125,7 @@ async function getSettings() {
       cancellationMode: data.cancellationMode === "timeRange" ? "timeRange" : "afterClosing",
       cancelWindowStart: data.cancelWindowStart || "18:00",
       cancelWindowEnd: data.cancelWindowEnd || "19:00",
+      restaurantClosed: !!data.restaurantClosed,
     };
   } catch {
     return {
@@ -137,6 +138,7 @@ async function getSettings() {
       cancellationMode: "afterClosing",
       cancelWindowStart: "18:00",
       cancelWindowEnd: "19:00",
+      restaurantClosed: false,
     };
   }
 }
@@ -525,6 +527,15 @@ const isValidPhoneish = (v) => /^[\d+\-\s()]{6,20}$/.test(String(v || "").trim()
 
 router.post("/", requireAuth, async (req, res) => {
   try {
+    const settings = await getSettings();
+    // Master switch, independent of the daily closing time — while the
+    // admin has the restaurant marked closed for today, no new order can
+    // be placed at all, full stop. Checked first so nothing else in this
+    // handler (pricing, pool math, etc.) runs for a blocked order.
+    if (settings.restaurantClosed) {
+      return res.status(403).json({ error: "The restaurant is closed today. Please check back tomorrow.", code: "RESTAURANT_CLOSED" });
+    }
+
     const customerName = cleanText(req.body && req.body.customerName, 80);
     const customerPhone = cleanText(req.body && req.body.customerPhone, 20);
     const address = cleanText(req.body && req.body.address, 300);
@@ -538,7 +549,6 @@ router.post("/", requireAuth, async (req, res) => {
 
     const id = "ORD-" + Date.now().toString(36).toUpperCase() + crypto.randomBytes(2).toString("hex").toUpperCase();
     const dateKey = istDateKey();
-    const settings = await getSettings();
 
     // Always written as "held" — reconcilePool (called right below) is the
     // one and only place that decides whether it should actually be
@@ -829,18 +839,28 @@ router.patch("/:id/undeliver", requireAdmin, async (req, res) => {
   }
 });
 
-/* Admin's single "Delivery arrived" broadcast for the day. Rather than
-   the admin clicking "deliver" on every order one at a time, this moves
-   EVERY of today's still-open orders (status "confirmed" or "preparing"
-   — "held" orders never reached the kitchen, so they're left alone) to
-   "delivered" in one batch, and stamps today's pool doc with
-   deliveryArrivedAt so every customer's live poll (GET /pool-status,
-   already running every few seconds) picks it up and shows a
-   below-header "delivery has arrived" notification — without needing a
-   push-notification service. Matches the front-end's rule that the last
-   8-10% of an order's progress bar only closes once the admin explicitly
-   confirms the order has reached the customer; this is that
-   confirmation, applied to the whole day's batch at once. */
+/* Admin's single "Notify order arrived" broadcast for the day. This does
+   TWO things, and only these two:
+     1. Sends every one of today's customers a push notification ("🛵
+        Delivery has arrived").
+     2. Moves today's orders that are actually "preparing" — i.e. the
+        kitchen has already started on them — to "delivered" in one
+        batch, so their progress bar completes and they move off the
+        admin's "Preparing" list onto "Arrived orders".
+   It deliberately does NOT touch orders still sitting at "confirmed".
+   An order that's still "confirmed" hasn't been started by the kitchen
+   yet, so silently fast-forwarding it straight to "delivered" would be
+   auto-verifying an order nobody actually prepared or handed over — that
+   was the bug this replaces (previously "confirmed" orders were swept
+   into the same batch as "preparing" ones). Those orders are left
+   exactly as they are; they'll reach "preparing" (and later get
+   delivered) the normal way, either automatically once their own
+   cancel window closes or by the admin moving them by hand.
+   "held" orders never reached the kitchen at all, so they're left alone
+   too. Stamps today's pool doc with deliveryArrivedAt so every
+   customer's live poll (GET /pool-status, already running every few
+   seconds) picks it up and shows the below-header "delivery has
+   arrived" notice — without needing a push-notification service. */
 router.post("/deliver-today", requireAdmin, async (req, res) => {
   try {
     const dateKey = istDateKey();
@@ -848,15 +868,15 @@ router.post("/deliver-today", requireAdmin, async (req, res) => {
     const toDeliver = [];
     snap.forEach((doc) => {
       const status = doc.data().status;
-      if (status === "confirmed" || status === "preparing") toDeliver.push(doc);
+      if (status === "preparing") toDeliver.push(doc);
     });
 
     const now = new Date().toISOString();
-    // Remember exactly what this broadcast touched (which orders, and what
-    // each one's status was right before) so a single "Undo" can cleanly
-    // reverse it later — see /deliver-today/undo below. previousStatuses is
-    // keyed by order id rather than assumed to be uniform, since a mixed
-    // batch of "confirmed" and "preparing" orders is normal.
+    // Remember exactly what this broadcast touched (which orders) so a
+    // single "Undo" can cleanly reverse it later — see /deliver-today/undo
+    // below. previousStatuses is keyed by order id; every entry here is
+    // "preparing" (the only status this broadcast ever moves), but kept as
+    // a map rather than a constant so /undo doesn't need to assume that.
     const previousStatuses = {};
     toDeliver.forEach((doc) => { previousStatuses[doc.id] = doc.data().status; });
 
@@ -1225,6 +1245,68 @@ router.post("/clear-dashboard/undo", requireAdmin, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Couldn't restore the dashboard." });
+  }
+});
+
+/* Monday–Sunday range (IST) containing "now" — the default window for
+   GET /revenue below when the admin hasn't picked a custom from/to yet.
+   Same +5.5h shift-then-UTC-getters trick as istDateKey(), so "today" and
+   "this week" always agree with the rest of the app's IST day boundaries
+   regardless of the server's own timezone. */
+function currentWeekRange() {
+  const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+  const day = ist.getUTCDay(); // 0 = Sunday … 6 = Saturday
+  const diffToMonday = day === 0 ? 6 : day - 1;
+  const monday = new Date(ist);
+  monday.setUTCDate(ist.getUTCDate() - diffToMonday);
+  const sunday = new Date(monday);
+  sunday.setUTCDate(monday.getUTCDate() + 6);
+  const fmt = (d) => d.toISOString().slice(0, 10);
+  return { from: fmt(monday), to: fmt(sunday) };
+}
+
+/* Admin revenue report: total DELIVERED order value per day across a date
+   range, plus the grand total for that range — what the "Revenue" tab in
+   the admin dashboard charts and lists. Defaults to the current
+   Monday–Sunday week when ?from/?to aren't given; the admin can pick any
+   custom range from the dashboard.
+   Only counts orders with status "delivered" — held/confirmed/preparing
+   orders haven't actually completed, and cancelled ones were never
+   fulfilled, so none of those belong in a revenue figure.
+   Deliberately filters status in memory rather than chaining a second
+   Firestore where() clause: a single range filter on one field (dateKey)
+   needs no manually-created composite index, so this works out of the box
+   on a fresh Firestore project without the admin ever touching the
+   Firebase console. */
+router.get("/revenue", requireAdmin, async (req, res) => {
+  try {
+    const week = currentWeekRange();
+    const isValidDateKey = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+    let from = isValidDateKey(req.query.from) ? req.query.from : week.from;
+    let to = isValidDateKey(req.query.to) ? req.query.to : week.to;
+    if (from > to) { const swap = from; from = to; to = swap; }
+
+    const snap = await ordersCol.where("dateKey", ">=", from).where("dateKey", "<=", to).get();
+    const byDay = {};
+    let total = 0;
+    let totalOrders = 0;
+    snap.forEach((doc) => {
+      const o = doc.data();
+      if (o.status !== "delivered") return;
+      const amount = Number(o.total) || 0;
+      const key = o.dateKey;
+      if (!byDay[key]) byDay[key] = { dateKey: key, amount: 0, count: 0 };
+      byDay[key].amount += amount;
+      byDay[key].count += 1;
+      total += amount;
+      totalOrders += 1;
+    });
+    const days = Object.values(byDay).sort((a, b) => (a.dateKey < b.dateKey ? -1 : 1));
+
+    res.json({ ok: true, from, to, days, total, totalOrders });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't load the revenue report." });
   }
 });
 

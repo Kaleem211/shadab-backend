@@ -39,6 +39,14 @@ const DEFAULTS = {
   cancellationMode: "afterClosing",
   cancelWindowStart: "18:00",  // 6:00 PM — only used when cancellationMode is "timeRange"
   cancelWindowEnd: "19:00",    // 7:00 PM — only used when cancellationMode is "timeRange"
+  // Master "closed for the day" switch — completely independent of
+  // closingTime. While true, the site blocks every new order (see
+  // POST /orders in routes/orders.js) and shows customers a "restaurant
+  // closed today, back tomorrow" message instead of the usual countdown.
+  // Never auto-resets: the admin turns it off by hand (typically the next
+  // morning) via the same toggle, so an accidental same-day flip doesn't
+  // silently reopen ordering while it's still in effect.
+  restaurantClosed: false,
 };
 
 const ALLOWED_KEYS = [
@@ -53,6 +61,7 @@ const ALLOWED_KEYS = [
   "cancellationMode",
   "cancelWindowStart",
   "cancelWindowEnd",
+  "restaurantClosed",
 ];
 
 /* Public: every customer's browser calls this on load so everyone always
@@ -121,6 +130,9 @@ router.put("/", requireAdmin, async (req, res) => {
     }
     if (updates.cancelWindowEnd && !/^\d{2}:\d{2}$/.test(updates.cancelWindowEnd)) {
       return res.status(400).json({ error: "cancelWindowEnd must be in HH:MM format." });
+    }
+    if (updates.restaurantClosed !== undefined) {
+      updates.restaurantClosed = !!updates.restaurantClosed;
     }
     // Guard against an inverted range only when both ends are present in
     // this update, or already present in the saved doc — so a partial
