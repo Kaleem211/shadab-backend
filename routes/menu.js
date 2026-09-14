@@ -37,6 +37,18 @@ router.put("/:id", requireAdmin, async (req, res) => {
       if (!body.name || !String(body.name).trim()) {
         return res.status(400).json({ error: "Enter a valid name." });
       }
+      // Optional: what the admin earns per unit of this item. Left unset,
+      // priceOrderItems() (routes/orders.js) treats it as a margin of 0
+      // (cost === price) rather than assuming a profit that was never
+      // configured. When set, it can't be negative or exceed the item's
+      // own price — a margin bigger than the price would mean a negative
+      // restaurant cost, which isn't meaningful.
+      if (body.profitMargin !== undefined && body.profitMargin !== null && body.profitMargin !== "") {
+        const margin = Number(body.profitMargin);
+        if (!Number.isFinite(margin) || margin < 0 || margin > price) {
+          return res.status(400).json({ error: "Profit margin must be a valid amount, and can't be more than the price." });
+        }
+      }
     }
 
     const data = { ...body, id };

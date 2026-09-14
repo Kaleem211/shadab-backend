@@ -490,6 +490,7 @@ async function priceOrderItems(rawItems) {
   const catalog = await getOrderableMenu();
   const priced = [];
   let total = 0;
+  let restaurantCost = 0;
 
   for (const raw of rawItems) {
     const id = raw && raw.id;
@@ -507,11 +508,26 @@ async function priceOrderItems(rawItems) {
         { status: 409 }
       );
     }
-    priced.push({ id: item.id, name: item.name, note: item.note || "", price: item.price, qty });
+
+    // What this item actually costs to buy from the restaurant, per unit.
+    // The admin sets a profit margin (₹) per item in Menu Management
+    // (item.profitMargin); cost = price - margin. This is snapshotted onto
+    // the order right now — not just looked up live when the revenue
+    // report is generated — so a later change to an item's margin never
+    // retroactively rewrites the profit on an order that's already been
+    // delivered. Items with no margin configured default to margin 0
+    // (cost = full price), so an unconfigured item shows zero profit
+    // instead of the report silently assuming a margin the admin never set.
+    const marginRaw = Number(item.profitMargin);
+    const margin = Number.isFinite(marginRaw) ? Math.max(0, Math.min(marginRaw, item.price)) : 0;
+    const cost = item.price - margin;
+
+    priced.push({ id: item.id, name: item.name, note: item.note || "", price: item.price, qty, cost, margin });
     total += item.price * qty;
+    restaurantCost += cost * qty;
   }
 
-  return { items: priced, total };
+  return { items: priced, total, restaurantCost };
 }
 
 // Trims, coerces to string, and caps length on free-text fields the
@@ -540,9 +556,9 @@ router.post("/", requireAuth, async (req, res) => {
     const customerPhone = cleanText(req.body && req.body.customerPhone, 20);
     const address = cleanText(req.body && req.body.address, 300);
 
-    let items, total;
+    let items, total, restaurantCost;
     try {
-      ({ items, total } = await priceOrderItems(req.body && req.body.items));
+      ({ items, total, restaurantCost } = await priceOrderItems(req.body && req.body.items));
     } catch (err) {
       return res.status(err.status || 400).json({ error: err.message });
     }
@@ -564,6 +580,7 @@ router.post("/", requireAuth, async (req, res) => {
       address: address || "",
       items,
       total,
+      restaurantCost,
       dateKey,
       status: "held",
       // Snapshot the delivery window — and everything the cancellation
@@ -1068,9 +1085,9 @@ async function applyOrderEdit(doc, body, { isAdmin }) {
     return { cancelled: true };
   }
 
-  let items, total;
+  let items, total, restaurantCost;
   try {
-    ({ items, total } = await priceOrderItems(rawItems));
+    ({ items, total, restaurantCost } = await priceOrderItems(rawItems));
   } catch (err) {
     throw Object.assign(new Error(err.message), { status: err.status || 400 });
   }
@@ -1079,7 +1096,7 @@ async function applyOrderEdit(doc, body, { isAdmin }) {
   // edit-order UI keeps these collapsed behind a link and only includes
   // them in the payload if the person opened it and changed something,
   // so an untouched field must NOT get overwritten with an empty string.
-  const update = { items, total };
+  const update = { items, total, restaurantCost };
   if (body.address !== undefined) update.address = cleanText(body.address, 300);
   if (body.phone !== undefined) {
     const phone = cleanText(body.phone, 20);
@@ -1168,9 +1185,9 @@ router.post("/admin-create", requireAdmin, async (req, res) => {
     if (!customerName) return res.status(400).json({ error: "Enter the customer's name." });
     if (!isValidPhoneish(customerPhone)) return res.status(400).json({ error: "Enter a valid mobile number." });
 
-    let items, total;
+    let items, total, restaurantCost;
     try {
-      ({ items, total } = await priceOrderItems(req.body && req.body.items));
+      ({ items, total, restaurantCost } = await priceOrderItems(req.body && req.body.items));
     } catch (err) {
       return res.status(err.status || 400).json({ error: err.message });
     }
@@ -1188,6 +1205,7 @@ router.post("/admin-create", requireAdmin, async (req, res) => {
       address: address || "",
       items,
       total,
+      restaurantCost,
       dateKey,
       status: forceConfirmed ? "confirmed" : "held",
       pinnedConfirmed: forceConfirmed,
@@ -1277,7 +1295,20 @@ function currentWeekRange() {
    Firestore where() clause: a single range filter on one field (dateKey)
    needs no manually-created composite index, so this works out of the box
    on a fresh Firestore project without the admin ever touching the
-   Firebase console. */
+   Firebase console.
+
+   Beyond the raw delivered-order total, this also reports, per day and as
+   range totals:
+   - paidToRestaurant: what the delivered items actually cost to buy from
+     the restaurant that day (sum of each order's restaurantCost, snapshot
+     at order time from the per-item profit margins set in Menu
+     Management — see priceOrderItems()).
+   - profit: amount - paidToRestaurant — what the admin actually keeps.
+   Orders placed before the profit-margin feature existed (or any order
+   somehow missing a restaurantCost) fall back to paidToRestaurant ===
+   amount for that order, i.e. zero profit, rather than letting a missing
+   number silently break the subtraction or invent a profit that was
+   never configured. */
 router.get("/revenue", requireAdmin, async (req, res) => {
   try {
     const week = currentWeekRange();
@@ -1289,21 +1320,27 @@ router.get("/revenue", requireAdmin, async (req, res) => {
     const snap = await ordersCol.where("dateKey", ">=", from).where("dateKey", "<=", to).get();
     const byDay = {};
     let total = 0;
+    let totalPaidToRestaurant = 0;
     let totalOrders = 0;
     snap.forEach((doc) => {
       const o = doc.data();
       if (o.status !== "delivered") return;
       const amount = Number(o.total) || 0;
+      const paid = Number.isFinite(Number(o.restaurantCost)) ? Number(o.restaurantCost) : amount;
       const key = o.dateKey;
-      if (!byDay[key]) byDay[key] = { dateKey: key, amount: 0, count: 0 };
+      if (!byDay[key]) byDay[key] = { dateKey: key, amount: 0, paidToRestaurant: 0, profit: 0, count: 0 };
       byDay[key].amount += amount;
+      byDay[key].paidToRestaurant += paid;
+      byDay[key].profit += amount - paid;
       byDay[key].count += 1;
       total += amount;
+      totalPaidToRestaurant += paid;
       totalOrders += 1;
     });
     const days = Object.values(byDay).sort((a, b) => (a.dateKey < b.dateKey ? -1 : 1));
+    const totalProfit = total - totalPaidToRestaurant;
 
-    res.json({ ok: true, from, to, days, total, totalOrders });
+    res.json({ ok: true, from, to, days, total, totalPaidToRestaurant, totalProfit, totalOrders });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Couldn't load the revenue report." });
