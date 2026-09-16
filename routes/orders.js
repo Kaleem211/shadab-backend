@@ -1407,12 +1407,22 @@ router.get("/revenue", requireAdmin, async (req, res) => {
       const paid = orderItems.length
         ? orderItems.reduce((sum, it) => sum + currentCostForOrderItem(it, catalog, nameIndex) * (Number(it.qty) || 0), 0)
         : (Number.isFinite(Number(o.restaurantCost)) ? Number(o.restaurantCost) : amount);
+      // Does any item in THIS order have no margin configured (or no
+      // catalog match at all)? Surfaced per-day below so the admin sees a
+      // ⚠️ right on the day row in the Revenue list, instead of only
+      // discovering an unconfigured margin after opening that day's
+      // item-level drill-down (/revenue/day, matchInfoForOrderItem()).
+      const orderHasMissingMargin = orderItems.some((it) => {
+        const info = matchInfoForOrderItem(it, catalog, nameIndex);
+        return !info.marginConfigured;
+      });
       const key = o.dateKey;
-      if (!byDay[key]) byDay[key] = { dateKey: key, amount: 0, paidToRestaurant: 0, profit: 0, count: 0 };
+      if (!byDay[key]) byDay[key] = { dateKey: key, amount: 0, paidToRestaurant: 0, profit: 0, count: 0, hasMissingMargin: false };
       byDay[key].amount += amount;
       byDay[key].paidToRestaurant += paid;
       byDay[key].profit += amount - paid;
       byDay[key].count += 1;
+      if (orderHasMissingMargin) byDay[key].hasMissingMargin = true;
       total += amount;
       totalPaidToRestaurant += paid;
       totalOrders += 1;

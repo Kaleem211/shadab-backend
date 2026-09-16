@@ -51,7 +51,20 @@ router.put("/:id", requireAdmin, async (req, res) => {
       }
     }
 
-    const data = { ...body, id };
+    // Merge onto whatever's already saved for this item instead of a bare
+    // overwrite. Root cause of "profit margin disappears even though it
+    // was set": .set(data) used to replace the ENTIRE doc with only the
+    // fields the caller happened to send. Hiding an item (see the
+    // frontend's deleteItem()) sends name/price/category/etc. but not
+    // profitMargin — under a blind overwrite that silently erased a
+    // margin the admin had already configured, and un-hiding the item
+    // later never brought it back because it was gone from Firestore.
+    // Merging means any field the caller doesn't mention is left alone;
+    // a field they DO send (including profitMargin: null, e.g. clearing
+    // the margin in the item form) still overwrites as before.
+    const existingDoc = await menuCol.doc(id).get();
+    const existingData = existingDoc.exists ? existingDoc.data() : {};
+    const data = { ...existingData, ...body, id };
     await menuCol.doc(id).set(data);
     res.json({ ok: true, item: data });
   } catch (err) {
