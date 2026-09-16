@@ -40,10 +40,27 @@ async function getOrderableMenu() {
     map.set(item.id, merged);
   });
 
+  // BUG (root cause of "profit margin set but Revenue still says 'no
+  // profit margin set for this item'" for any CUSTOM item — one added by
+  // the admin rather than one of the BASE_MENU items above, e.g. "Chicken
+  // rice", "Double egg rice"): this used to rebuild the item from a
+  // hand-picked list of fields (id/name/price/note/category) instead of
+  // spreading the override doc. profitMargin (and anything else the admin
+  // set — description, icon, imageData, etc.) was silently dropped every
+  // single time the catalog was rebuilt, even though it was saved
+  // correctly in Firestore by PUT /api/menu. currentCostForOrderItem() /
+  // priceOrderItems() then always saw item.profitMargin === undefined for
+  // these items and fell back to "no margin configured" — no matter how
+  // many times the admin set and saved a margin for them in Menu
+  // Management. Base-menu items were spared because their merge above
+  // (`{ ...item, ...ov }`) already spreads the override. Custom items now
+  // get the same treatment: spread `ov` first so every saved field
+  // (profitMargin included) survives, then only fill in the few fields
+  // that need a fallback when the admin didn't set them.
   const baseIds = new Set(BASE_MENU.map((m) => m.id));
   overridesById.forEach((ov, id) => {
     if (baseIds.has(id) || ov.deleted) return;
-    map.set(id, { id, name: ov.name, price: ov.price, note: ov.note || "", category: ov.category || "Other" });
+    map.set(id, { ...ov, id, note: ov.note || "", category: ov.category || "Other" });
   });
 
   return map;
