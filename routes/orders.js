@@ -509,15 +509,17 @@ async function priceOrderItems(rawItems) {
       );
     }
 
-    // What this item actually costs to buy from the restaurant, per unit.
-    // The admin sets a profit margin (₹) per item in Menu Management
-    // (item.profitMargin); cost = price - margin. This is snapshotted onto
-    // the order right now — not just looked up live when the revenue
-    // report is generated — so a later change to an item's margin never
-    // retroactively rewrites the profit on an order that's already been
-    // delivered. Items with no margin configured default to margin 0
-    // (cost = full price), so an unconfigured item shows zero profit
-    // instead of the report silently assuming a margin the admin never set.
+    // What this item actually costs to buy from the restaurant, per unit,
+    // at the moment the order is placed. The admin sets a profit margin
+    // (₹) per item in Menu Management (item.profitMargin); cost = price -
+    // margin. This is snapshotted onto the order as a fallback for items
+    // later removed from the menu entirely — the revenue reports
+    // (GET /revenue, /revenue/day in this file) instead recompute cost
+    // from each item's CURRENT margin every time they're requested, so
+    // editing a margin in Menu Management updates profit for past orders
+    // too, not just ones placed afterward. Items with no margin configured
+    // default to margin 0 (cost = full price), so an unconfigured item
+    // shows zero profit instead of assuming a margin nobody set.
     const marginRaw = Number(item.profitMargin);
     const margin = Number.isFinite(marginRaw) ? Math.max(0, Math.min(marginRaw, item.price)) : 0;
     const cost = item.price - margin;
@@ -1283,6 +1285,79 @@ function currentWeekRange() {
   return { from: fmt(monday), to: fmt(sunday) };
 }
 
+/* Given one order's line item and the CURRENT menu catalog, works out
+   what that item costs to buy from the restaurant RIGHT NOW. The revenue
+   reports below use this instead of the cost/margin that was snapshotted
+   onto the order at checkout time (see priceOrderItems()) — so setting or
+   correcting a margin in Menu Management updates the profit shown for
+   every past order that included that item, not just orders placed after
+   the margin was set. This matters for Cravix's actual workflow: margins
+   often get entered into Menu Management well after the orders they
+   apply to were already delivered, and the admin wants those past days'
+   profit figures to reflect the real numbers once they're known — not
+   stay frozen at "unconfigured".
+   Looks up by item id first (the normal case). Some orders placed before
+   priceOrderItems() started stamping an id onto each line item only have
+   a name to go on, so those fall back to a case-insensitive name match
+   against the live catalog (nameIndex) — this is what makes margins
+   apply retroactively even to that older batch of orders, not just ones
+   with a matching id.
+   Falls back to whatever cost/margin WAS snapshotted on the order itself
+   if the item can't be found in the catalog by either id or name (e.g.
+   it's since been deleted from the menu and renamed), and finally to
+   cost === price (zero profit) if neither is available — never inventing
+   a margin that was never configured anywhere. */
+function currentCostForOrderItem(it, catalog, nameIndex) {
+  const price = Number(it.price) || 0;
+  let catalogItem = it.id ? catalog.get(it.id) : null;
+  if (!catalogItem && it.name && nameIndex) {
+    catalogItem = nameIndex.get(String(it.name).trim().toLowerCase()) || null;
+  }
+  if (catalogItem) {
+    const marginRaw = Number(catalogItem.profitMargin);
+    if (Number.isFinite(marginRaw)) {
+      const margin = Math.max(0, Math.min(marginRaw, price));
+      return price - margin;
+    }
+  }
+  if (Number.isFinite(Number(it.cost))) return Number(it.cost);
+  return price;
+}
+
+/* Case-insensitive name -> catalog item index, built once per revenue
+   request and reused across every order's items — the id lookup in
+   currentCostForOrderItem() above covers most items, this only gets used
+   as its fallback for older line items that were stored without an id. */
+function buildCatalogNameIndex(catalog) {
+  const index = new Map();
+  catalog.forEach((item) => {
+    if (item && item.name) index.set(String(item.name).trim().toLowerCase(), item);
+  });
+  return index;
+}
+
+/* Same lookup as currentCostForOrderItem() above, but reports HOW the
+   item was matched (or that it wasn't) instead of just the resulting
+   cost. Only used by /revenue/day, which surfaces this per item so an
+   admin can see directly why a given item's margin isn't being applied —
+   instead of just staring at ₹0 profit with no way to tell whether the
+   margin is missing, the item couldn't be matched, or something else. */
+function matchInfoForOrderItem(it, catalog, nameIndex) {
+  if (it.id && catalog.get(it.id)) {
+    const item = catalog.get(it.id);
+    const marginRaw = Number(item.profitMargin);
+    return { matchedBy: "id", marginConfigured: Number.isFinite(marginRaw), margin: Number.isFinite(marginRaw) ? marginRaw : null };
+  }
+  if (it.name && nameIndex) {
+    const item = nameIndex.get(String(it.name).trim().toLowerCase());
+    if (item) {
+      const marginRaw = Number(item.profitMargin);
+      return { matchedBy: "name", marginConfigured: Number.isFinite(marginRaw), margin: Number.isFinite(marginRaw) ? marginRaw : null };
+    }
+  }
+  return { matchedBy: "none", marginConfigured: false, margin: null };
+}
+
 /* Admin revenue report: total DELIVERED order value per day across a date
    range, plus the grand total for that range — what the "Revenue" tab in
    the admin dashboard charts and lists. Defaults to the current
@@ -1299,16 +1374,14 @@ function currentWeekRange() {
 
    Beyond the raw delivered-order total, this also reports, per day and as
    range totals:
-   - paidToRestaurant: what the delivered items actually cost to buy from
-     the restaurant that day (sum of each order's restaurantCost, snapshot
-     at order time from the per-item profit margins set in Menu
-     Management — see priceOrderItems()).
+   - paidToRestaurant: what the delivered items cost to buy from the
+     restaurant, using each item's CURRENT profit margin from Menu
+     Management (see currentCostForOrderItem() above) — so this always
+     reflects the latest margins, including for orders placed before a
+     margin was ever set.
    - profit: amount - paidToRestaurant — what the admin actually keeps.
-   Orders placed before the profit-margin feature existed (or any order
-   somehow missing a restaurantCost) fall back to paidToRestaurant ===
-   amount for that order, i.e. zero profit, rather than letting a missing
-   number silently break the subtraction or invent a profit that was
-   never configured. */
+   An item with no margin configured (ever) still falls back to cost ===
+   price (zero profit on that item) rather than inventing one. */
 router.get("/revenue", requireAdmin, async (req, res) => {
   try {
     const week = currentWeekRange();
@@ -1317,7 +1390,11 @@ router.get("/revenue", requireAdmin, async (req, res) => {
     let to = isValidDateKey(req.query.to) ? req.query.to : week.to;
     if (from > to) { const swap = from; from = to; to = swap; }
 
-    const snap = await ordersCol.where("dateKey", ">=", from).where("dateKey", "<=", to).get();
+    const [snap, catalog] = await Promise.all([
+      ordersCol.where("dateKey", ">=", from).where("dateKey", "<=", to).get(),
+      getOrderableMenu(),
+    ]);
+    const nameIndex = buildCatalogNameIndex(catalog);
     const byDay = {};
     let total = 0;
     let totalPaidToRestaurant = 0;
@@ -1326,7 +1403,10 @@ router.get("/revenue", requireAdmin, async (req, res) => {
       const o = doc.data();
       if (o.status !== "delivered") return;
       const amount = Number(o.total) || 0;
-      const paid = Number.isFinite(Number(o.restaurantCost)) ? Number(o.restaurantCost) : amount;
+      const orderItems = Array.isArray(o.items) ? o.items : [];
+      const paid = orderItems.length
+        ? orderItems.reduce((sum, it) => sum + currentCostForOrderItem(it, catalog, nameIndex) * (Number(it.qty) || 0), 0)
+        : (Number.isFinite(Number(o.restaurantCost)) ? Number(o.restaurantCost) : amount);
       const key = o.dateKey;
       if (!byDay[key]) byDay[key] = { dateKey: key, amount: 0, paidToRestaurant: 0, profit: 0, count: 0 };
       byDay[key].amount += amount;
@@ -1351,15 +1431,10 @@ router.get("/revenue", requireAdmin, async (req, res) => {
    day, aggregated per menu item — this is what tapping a day row in the
    Revenue tab opens. For each item that was delivered that day this
    reports how many units went out, what customers paid for them, what
-   they cost to buy from the restaurant, and the profit — using the same
-   per-item cost/margin snapshotted onto the order at checkout time that
-   GET /revenue itself sums up (see priceOrderItems()), so these rows
-   always add up to exactly that day's amount/paidToRestaurant/profit in
-   the Revenue list above.
-   Orders (or items on them) from before the profit-margin feature existed
-   fall back to cost === price for that item, i.e. zero profit on it,
-   same fallback GET /revenue uses — never inventing a margin that was
-   never configured. */
+   they cost to buy from the restaurant (current margin — see
+   currentCostForOrderItem() above), and the profit — so these rows always
+   add up to exactly that day's amount/paidToRestaurant/profit in the
+   Revenue list above. */
 router.get("/revenue/day", requireAdmin, async (req, res) => {
   try {
     const isValidDateKey = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
@@ -1368,7 +1443,11 @@ router.get("/revenue/day", requireAdmin, async (req, res) => {
       return res.status(400).json({ error: "A valid date (YYYY-MM-DD) is required." });
     }
 
-    const snap = await ordersCol.where("dateKey", "==", date).get();
+    const [snap, catalog] = await Promise.all([
+      ordersCol.where("dateKey", "==", date).get(),
+      getOrderableMenu(),
+    ]);
+    const nameIndex = buildCatalogNameIndex(catalog);
     const itemsById = {};
     let amount = 0;
     let paidToRestaurant = 0;
@@ -1378,23 +1457,18 @@ router.get("/revenue/day", requireAdmin, async (req, res) => {
       const o = doc.data();
       if (o.status !== "delivered") return;
       orderCount += 1;
-
-      const orderTotal = Number(o.total) || 0;
-      const orderPaid = Number.isFinite(Number(o.restaurantCost)) ? Number(o.restaurantCost) : orderTotal;
-      amount += orderTotal;
-      paidToRestaurant += orderPaid;
+      amount += Number(o.total) || 0;
 
       const orderItems = Array.isArray(o.items) ? o.items : [];
       orderItems.forEach((it) => {
         const qty = Number(it.qty) || 0;
         if (qty <= 0) return;
         const price = Number(it.price) || 0;
-        // cost is snapshotted on the item by priceOrderItems(); older
-        // orders that predate that fall back to cost === price (margin 0).
-        const cost = Number.isFinite(Number(it.cost)) ? Number(it.cost) : price;
+        const cost = currentCostForOrderItem(it, catalog, nameIndex);
+        paidToRestaurant += cost * qty;
         const key = it.id || it.name;
         if (!itemsById[key]) {
-          itemsById[key] = { id: it.id || null, name: it.name || "Item", qty: 0, amount: 0, paidToRestaurant: 0, profit: 0 };
+          itemsById[key] = { id: it.id || null, name: it.name || "Item", qty: 0, amount: 0, paidToRestaurant: 0, profit: 0, ...matchInfoForOrderItem(it, catalog, nameIndex) };
         }
         const row = itemsById[key];
         row.qty += qty;
