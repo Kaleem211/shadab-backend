@@ -1347,6 +1347,73 @@ router.get("/revenue", requireAdmin, async (req, res) => {
   }
 });
 
+/* Admin revenue drill-down: every delivered order's items for ONE specific
+   day, aggregated per menu item — this is what tapping a day row in the
+   Revenue tab opens. For each item that was delivered that day this
+   reports how many units went out, what customers paid for them, what
+   they cost to buy from the restaurant, and the profit — using the same
+   per-item cost/margin snapshotted onto the order at checkout time that
+   GET /revenue itself sums up (see priceOrderItems()), so these rows
+   always add up to exactly that day's amount/paidToRestaurant/profit in
+   the Revenue list above.
+   Orders (or items on them) from before the profit-margin feature existed
+   fall back to cost === price for that item, i.e. zero profit on it,
+   same fallback GET /revenue uses — never inventing a margin that was
+   never configured. */
+router.get("/revenue/day", requireAdmin, async (req, res) => {
+  try {
+    const isValidDateKey = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+    const date = req.query.date;
+    if (!isValidDateKey(date)) {
+      return res.status(400).json({ error: "A valid date (YYYY-MM-DD) is required." });
+    }
+
+    const snap = await ordersCol.where("dateKey", "==", date).get();
+    const itemsById = {};
+    let amount = 0;
+    let paidToRestaurant = 0;
+    let orderCount = 0;
+
+    snap.forEach((doc) => {
+      const o = doc.data();
+      if (o.status !== "delivered") return;
+      orderCount += 1;
+
+      const orderTotal = Number(o.total) || 0;
+      const orderPaid = Number.isFinite(Number(o.restaurantCost)) ? Number(o.restaurantCost) : orderTotal;
+      amount += orderTotal;
+      paidToRestaurant += orderPaid;
+
+      const orderItems = Array.isArray(o.items) ? o.items : [];
+      orderItems.forEach((it) => {
+        const qty = Number(it.qty) || 0;
+        if (qty <= 0) return;
+        const price = Number(it.price) || 0;
+        // cost is snapshotted on the item by priceOrderItems(); older
+        // orders that predate that fall back to cost === price (margin 0).
+        const cost = Number.isFinite(Number(it.cost)) ? Number(it.cost) : price;
+        const key = it.id || it.name;
+        if (!itemsById[key]) {
+          itemsById[key] = { id: it.id || null, name: it.name || "Item", qty: 0, amount: 0, paidToRestaurant: 0, profit: 0 };
+        }
+        const row = itemsById[key];
+        row.qty += qty;
+        row.amount += price * qty;
+        row.paidToRestaurant += cost * qty;
+        row.profit += (price - cost) * qty;
+      });
+    });
+
+    const items = Object.values(itemsById).sort((a, b) => b.amount - a.amount);
+    const profit = amount - paidToRestaurant;
+
+    res.json({ ok: true, date, items, amount, paidToRestaurant, profit, orderCount });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't load that day's order details." });
+  }
+});
+
 module.exports = router;
 /* Exposed for routes/settings.js (reconcile immediately after a settings
    change, so a new closing time/grace/cancel-window takes effect right
