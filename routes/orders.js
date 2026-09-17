@@ -337,8 +337,8 @@ async function reconcilePoolUncached(dateKey, minPoolOverride, settingsOverride)
     toPromote.forEach((doc) => {
       const o = doc.data();
       notifyCustomer(o.userMobile, {
-        title: "Your order is being prepared 👨‍🍳",
-        body: `Your ${itemSummary(o.items)} started preparing 👨‍🍳 — get ready to collect!`,
+        title: "Track your order 🛵",
+        body: `Your ${itemSummary(o.items)} is being prepared 👨‍🍳 — tap to track it live now!`,
         tag: `order-${o.id}`,
         url: "/#orders",
       }).catch((err) => console.error("Preparing push failed:", err));
@@ -468,8 +468,8 @@ async function maybeNotifyPoolFailure(dateKey, settings, poolState) {
     snap.forEach((doc) => {
       const o = doc.data();
       notifyCustomer(o.userMobile, {
-        title: "😞 Sorry, today's order pool wasn't reached",
-        body: `Today's minimum order pool of ₹${poolState.minAmount} wasn't reached in time, so the restaurant can't deliver today. Sorry for the inconvenience!`,
+        title: "😞 Sorry, we can't deliver today",
+        body: `We didn't receive enough orders today, so the restaurant can't deliver. Sorry for the inconvenience!`,
         tag: `pool-failed-${dateKey}`,
         url: "/#orders",
       }).catch((err) => console.error("Pool-failed push failed:", err));
@@ -811,7 +811,7 @@ router.patch("/:id/status", requireAdmin, async (req, res) => {
   const o = doc.data();
   notifyCustomer(o.userMobile, status === "delivered"
     ? { title: "Order arrived! ✅", body: `Your ${itemSummary(o.items)} has arrived ✅ — pick up your order!`, tag: `order-${o.id}`, url: "/#orders" }
-    : { title: "Your order is being prepared 👨‍🍳", body: `Your ${itemSummary(o.items)} started preparing 👨‍🍳 — get ready to collect!`, tag: `order-${o.id}`, url: "/#orders" }
+    : { title: "Track your order 🛵", body: `Your ${itemSummary(o.items)} is being prepared 👨‍🍳 — tap to track it live now!`, tag: `order-${o.id}`, url: "/#orders" }
   ).catch((err) => console.error("Status push failed:", err));
   res.json({ ok: true });
 });
