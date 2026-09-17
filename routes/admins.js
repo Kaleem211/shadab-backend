@@ -4,10 +4,14 @@ const {
   requireAdmin, getAdminSecurity, invalidateAdminSecurityCache,
   hashPassword, checkPassword, assertStrongEnough, passwordStrength,
 } = require("../utils/auth");
+const { invalidate } = require("../utils/cache");
 
 const router = express.Router();
 const adminsCol = db.collection("admins");
 const adminSecurityDoc = db.collection("adminSecurity").doc("config");
+// Development Mode — see utils/push.js's getDevMode() for how this doc
+// is read (and cached) when deciding whether to send a notification.
+const devModeDoc = db.collection("appConfig").doc("devMode");
 
 /* Tells the front-end which of the two admin passwords was just used to
    unlock this request — requireAdmin already did the actual verification
@@ -19,6 +23,74 @@ const adminSecurityDoc = db.collection("adminSecurity").doc("config");
    this browser session (sessionStorage, with an inactivity timeout). */
 router.get("/verify", requireAdmin, (req, res) => {
   res.json({ ok: true, type: req.adminPasswordType, name: req.user.username });
+});
+
+/* =========================================================
+   DEVELOPMENT MODE 🚧
+   A single shared on/off switch, gated to the CENTRAL password only,
+   for testing the live site without disturbing anyone else:
+     - GET  /dev-mode          — current status (any admin can read it)
+     - POST /dev-mode/enable   — turns it on, recording WHO (by mobile —
+       the customer account that unlocked admin) turned it on
+     - POST /dev-mode/disable  — turns it off
+   utils/push.js's notifyCustomer/notifyAllAdmins read this same doc to
+   silently skip every notification except the ones addressed to the
+   developer's own mobile number, so real customers and other admins
+   never see test traffic while this is on. It never blocks ordering
+   itself — only notifications. */
+router.get("/dev-mode", requireAdmin, async (req, res) => {
+  try {
+    const doc = await devModeDoc.get();
+    const data = doc.exists ? doc.data() : {};
+    const enabled = !!data.enabled;
+    res.json({
+      ok: true,
+      enabled,
+      developerName: enabled ? (data.developerName || data.developerMobile || null) : null,
+      isYou: enabled && data.developerMobile === req.user.mobile,
+      canToggle: req.adminPasswordType === "central",
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't load Development Mode status." });
+  }
+});
+
+router.post("/dev-mode/enable", requireAdmin, async (req, res) => {
+  if (req.adminPasswordType !== "central") {
+    return res.status(403).json({ error: "Unlock admin with the central password to turn on Development Mode." });
+  }
+  try {
+    const developerName = req.user.username || req.user.mobile;
+    await devModeDoc.set({
+      enabled: true,
+      developerMobile: req.user.mobile,
+      developerName,
+      enabledAt: new Date().toISOString(),
+    });
+    invalidate("dev-mode-doc");
+    res.json({ ok: true, enabled: true, developerName });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't turn on Development Mode." });
+  }
+});
+
+router.post("/dev-mode/disable", requireAdmin, async (req, res) => {
+  if (req.adminPasswordType !== "central") {
+    return res.status(403).json({ error: "Unlock admin with the central password to turn off Development Mode." });
+  }
+  try {
+    await devModeDoc.set(
+      { enabled: false, developerMobile: null, developerName: null, disabledAt: new Date().toISOString() },
+      { merge: true }
+    );
+    invalidate("dev-mode-doc");
+    res.json({ ok: true, enabled: false });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't turn off Development Mode." });
+  }
 });
 
 /* Change the CENTRAL (master) admin password. Requires the CURRENT

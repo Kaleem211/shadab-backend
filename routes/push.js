@@ -71,6 +71,11 @@ router.post("/subscribe-admin", requireAdmin, async (req, res) => {
     await adminSubsCol.doc(key).set({
       subscription,
       passwordType: req.adminPasswordType || null,
+      // Which admin identity owns this device — set by requireAdmin from
+      // the logged-in customer account that unlocked admin. This is what
+      // lets Development Mode narrow new-order alerts down to just the
+      // developer's own device(s) instead of every central-admin device.
+      mobile: (req.user && req.user.mobile) || null,
       savedAt: new Date().toISOString(),
     });
     console.log(`[push] subscribe-admin: saved device ${key.slice(0, 8)}… (${req.adminPasswordType || "unknown"} password)`);
