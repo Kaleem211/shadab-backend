@@ -93,9 +93,15 @@ async function maybeAutoClearDashboard() {
    confirms itself AND every other held order from that day, in one batch,
    so nobody's food gets started until the kitchen has a worthwhile batch.
 
-   Order status lifecycle: held -> confirmed -> preparing -> delivered
-   (or -> cancelled from held/confirmed — not from preparing, since the
-   kitchen has already started by then). "confirmed" means the pool
+   Order status lifecycle: held -> confirmed -> preparing -> arrived ->
+   delivered (or -> cancelled from held/confirmed — not from preparing,
+   since the kitchen has already started by then). "arrived" is set in
+   bulk by the admin's "Notify order" broadcast (POST /deliver-today,
+   below) — it means the kitchen has physically brought the batch to the
+   pickup point, but the admin hasn't yet verified this particular order
+   was actually handed over. Only the admin explicitly ticking it in the
+   Verify Orders panel (PATCH /:id/deliver) moves it the rest of the way
+   to "delivered". "confirmed" means the pool
    minimum is CURRENTLY met; that's re-evaluated continuously, so if
    enough cancellations drag the day's total back under the minimum, any
    order still sitting at "confirmed" (i.e. not yet "preparing") drops
@@ -781,7 +787,12 @@ router.patch("/:id/status", requireAdmin, async (req, res) => {
   if (status === "preparing" && current !== "confirmed") {
     return res.status(400).json({ error: `Can't move to preparing from '${current}'.` });
   }
-  if (status === "delivered" && !["confirmed", "preparing"].includes(current)) {
+  // "arrived" is included here too — an order the /deliver-today broadcast
+  // already marked arrived still needs to be reachable as "delivered" once
+  // the admin verifies it (see PATCH /:id/deliver, which is what the
+  // Verify Orders checkbox actually calls; this generic route is kept in
+  // step with it for any other caller).
+  if (status === "delivered" && !["confirmed", "preparing", "arrived"].includes(current)) {
     return res.status(400).json({ error: `Can't mark delivered from '${current}'.` });
   }
   const update = { status, [`${status}At`]: new Date().toISOString() };
@@ -863,31 +874,44 @@ router.patch("/:id/undeliver", requireAdmin, async (req, res) => {
      1. Sends every one of today's customers a push notification ("🛵
         Delivery has arrived").
      2. Moves today's orders that are actually "preparing" — i.e. the
-        kitchen has already started on them — to "delivered" in one
-        batch, so their progress bar completes and they move off the
-        admin's "Preparing" list onto "Arrived orders".
+        kitchen has already started on them — to "arrived" (NOT straight
+        to "delivered") in one batch, so they move off the admin's
+        "Confirmed" list onto a dedicated "Arrived orders" tab.
    It deliberately does NOT touch orders still sitting at "confirmed".
    An order that's still "confirmed" hasn't been started by the kitchen
-   yet, so silently fast-forwarding it straight to "delivered" would be
-   auto-verifying an order nobody actually prepared or handed over — that
+   yet, so silently fast-forwarding it straight to "arrived" would be
+   claiming a delivery nobody actually prepared or handed over — that
    was the bug this replaces (previously "confirmed" orders were swept
    into the same batch as "preparing" ones). Those orders are left
    exactly as they are; they'll reach "preparing" (and later get
-   delivered) the normal way, either automatically once their own
+   notified) the normal way, either automatically once their own
    cancel window closes or by the admin moving them by hand.
    "held" orders never reached the kitchen at all, so they're left alone
-   too. Stamps today's pool doc with deliveryArrivedAt so every
-   customer's live poll (GET /pool-status, already running every few
-   seconds) picks it up and shows the below-header "delivery has
-   arrived" notice — without needing a push-notification service. */
+   too.
+   IMPORTANT: this never sets status "delivered" directly. Landing on
+   "delivered" used to happen right here, which caused two bugs at once —
+   (a) the admin's Verify Orders panel derives its checkbox straight from
+   status === "delivered", so every order this touched showed up
+   pre-ticked/"verified" without the admin ever actually checking it by
+   hand, and (b) maybeAutoClearDashboard() treats "delivered" as done-for
+   -the-day, so if this broadcast happened to be the last active order,
+   the WHOLE admin dashboard cleared itself the instant the button was
+   tapped. Landing on the new "arrived" status instead means the order is
+   still "active" as far as both of those are concerned — the admin has
+   to explicitly verify it (tick it in Verify Orders, which is the only
+   thing that ever sets "delivered") before either of those trigger.
+   Stamps today's pool doc with deliveryArrivedAt so every customer's
+   live poll (GET /pool-status, already running every few seconds) picks
+   it up and shows the below-header "delivery has arrived" notice —
+   without needing a push-notification service. */
 router.post("/deliver-today", requireAdmin, async (req, res) => {
   try {
     const dateKey = istDateKey();
     const snap = await ordersCol.where("dateKey", "==", dateKey).get();
-    const toDeliver = [];
+    const toArrive = [];
     snap.forEach((doc) => {
       const status = doc.data().status;
-      if (status === "preparing") toDeliver.push(doc);
+      if (status === "preparing") toArrive.push(doc);
     });
 
     const now = new Date().toISOString();
@@ -897,13 +921,13 @@ router.post("/deliver-today", requireAdmin, async (req, res) => {
     // "preparing" (the only status this broadcast ever moves), but kept as
     // a map rather than a constant so /undo doesn't need to assume that.
     const previousStatuses = {};
-    toDeliver.forEach((doc) => { previousStatuses[doc.id] = doc.data().status; });
+    toArrive.forEach((doc) => { previousStatuses[doc.id] = doc.data().status; });
 
-    if (toDeliver.length) {
+    if (toArrive.length) {
       const batch = db.batch();
-      toDeliver.forEach((doc) => batch.update(doc.ref, { status: "delivered", deliveredAt: now }));
+      toArrive.forEach((doc) => batch.update(doc.ref, { status: "arrived", arrivedAt: now }));
       await batch.commit();
-      toDeliver.forEach((doc) => {
+      toArrive.forEach((doc) => {
         const o = doc.data();
         notifyCustomer(o.userMobile, {
           title: "Order arrived! ✅",
@@ -918,14 +942,18 @@ router.post("/deliver-today", requireAdmin, async (req, res) => {
       {
         dateKey,
         deliveryArrivedAt: now,
-        lastDeliveryBroadcast: { at: now, orderIds: toDeliver.map((d) => d.id), previousStatuses },
+        lastDeliveryBroadcast: { at: now, orderIds: toArrive.map((d) => d.id), previousStatuses },
       },
       { merge: true }
     );
 
     invalidatePool(dateKey);
-    await maybeAutoClearDashboard();
-    res.json({ ok: true, deliveredCount: toDeliver.length, deliveryArrivedAt: now });
+    // Deliberately NOT calling maybeAutoClearDashboard() here — this
+    // broadcast never lands anything on "delivered" by itself, so there's
+    // nothing for it to legitimately trigger on yet. It still runs
+    // normally later, from PATCH /:id/deliver, once the admin actually
+    // verifies each arrived order.
+    res.json({ ok: true, arrivedCount: toArrive.length, deliveredCount: toArrive.length, deliveryArrivedAt: now });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Couldn't mark today's delivery as arrived." });
@@ -934,11 +962,11 @@ router.post("/deliver-today", requireAdmin, async (req, res) => {
 
 /* Reverses the most recent /deliver-today broadcast for the current day —
    the admin dashboard's "Undo" action. Only reverts orders that are still
-   exactly as that broadcast left them (status "delivered" with a matching
-   deliveredAt timestamp); an order a customer or admin touched separately
-   since then is left alone rather than silently rewound. Available until
-   the admin broadcasts delivery again or a new day's pool doc starts fresh
-   with no lastDeliveryBroadcast recorded. */
+   exactly as that broadcast left them (status "arrived" with a matching
+   arrivedAt timestamp); an order the admin already verified (moved on to
+   "delivered") or touched separately since then is left alone rather than
+   silently rewound. Available until the admin broadcasts delivery again or
+   a new day's pool doc starts fresh with no lastDeliveryBroadcast recorded. */
 router.post("/deliver-today/undo", requireAdmin, async (req, res) => {
   try {
     const dateKey = istDateKey();
@@ -967,14 +995,14 @@ router.post("/deliver-today/undo", requireAdmin, async (req, res) => {
       const toRevert = docs.filter((doc) => {
         if (!doc.exists) return false;
         const o = doc.data();
-        return o.status === "delivered" && o.deliveredAt === broadcast.at;
+        return o.status === "arrived" && o.arrivedAt === broadcast.at;
       });
 
       if (toRevert.length) {
         const batch = db.batch();
         toRevert.forEach((doc) => {
           const restoredStatus = broadcast.previousStatuses[doc.id] || "confirmed";
-          batch.update(doc.ref, { status: restoredStatus, deliveredAt: null });
+          batch.update(doc.ref, { status: restoredStatus, arrivedAt: null });
         });
         await batch.commit();
       }
