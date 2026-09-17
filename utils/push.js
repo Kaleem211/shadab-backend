@@ -20,9 +20,25 @@
 const webpush = require("web-push");
 const crypto = require("crypto");
 const db = require("../db");
+const { getOrFetch } = require("./cache");
 
 const usersCol = db.collection("users");
 const adminSubsCol = db.collection("adminPushSubscriptions");
+// Development Mode config — see routes/admins.js's /dev-mode endpoints
+// for how this doc gets written. Kept in its own top-level doc (like
+// adminSecurityDoc) rather than in the public `settings` collection, since
+// it names a specific admin's mobile number and has no reason to ever be
+// exposed to GET /settings.
+const devModeDoc = db.collection("appConfig").doc("devMode");
+
+/* Short-TTL cached read — this is checked on EVERY notifyCustomer/
+   notifyAllAdmins call (i.e. on every order placed/confirmed/status-
+   changed), so it can't be a fresh Firestore read every time. Mirrors the
+   settings-doc cache pattern in routes/settings.js. */
+async function getDevMode() {
+  const doc = await getOrFetch("dev-mode-doc", 5000, () => devModeDoc.get());
+  return doc.exists ? doc.data() : { enabled: false };
+}
 
 const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || "";
 const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "";
@@ -96,6 +112,15 @@ async function notifyCustomer(mobile, payload) {
   if (!configured) { console.log("[push] notifyCustomer skipped — VAPID not configured"); return; }
   if (!mobile) { console.log("[push] notifyCustomer skipped — no mobile number on this order"); return; }
   try {
+    // Development Mode: while it's on, only the developer's own mobile
+    // number (the account they unlocked admin with, using the central
+    // password) ever gets a customer-facing notification — every other
+    // real customer is silently skipped so testing never spams them.
+    const devMode = await getDevMode();
+    if (devMode.enabled && devMode.developerMobile && mobile !== devMode.developerMobile) {
+      console.log(`[push] notifyCustomer ${mobile}: skipped — Development Mode is on (only ${devMode.developerMobile} receives notifications)`);
+      return;
+    }
     const snap = await usersCol.where("mobile", "==", mobile).limit(1).get();
     if (snap.empty) { console.log(`[push] notifyCustomer: no user doc found for mobile ${mobile}`); return; }
     const doc = snap.docs[0];
@@ -121,20 +146,32 @@ async function notifyCustomer(mobile, payload) {
  * Each subscription doc records which password unlocked it at
  * subscribe-admin time (see routes/push.js), so this is a plain
  * Firestore filter rather than anything computed here.
+ *
+ * Development Mode narrows this further: while it's on, only the
+ * developer's OWN device(s) — the ones registered under the mobile
+ * number that turned Development Mode on — get paged. Every other
+ * admin, even other central-password holders, is silently skipped so a
+ * developer testing the flow doesn't page the whole team.
  */
 async function notifyAllAdmins(payload) {
   if (!configured) { console.log("[push] notifyAllAdmins skipped — VAPID not configured"); return; }
   try {
+    const devMode = await getDevMode();
     const snap = await adminSubsCol.where("passwordType", "==", "central").get();
     if (snap.empty) { console.log("[push] notifyAllAdmins: 0 central-admin devices subscribed"); return; }
+    let docs = snap.docs;
+    if (devMode.enabled && devMode.developerMobile) {
+      docs = docs.filter((doc) => doc.data().mobile === devMode.developerMobile);
+      if (!docs.length) { console.log(`[push] notifyAllAdmins: Development Mode is on — no subscribed device for developer ${devMode.developerMobile}`); return; }
+    }
     const dead = [];
     await Promise.all(
-      snap.docs.map(async (doc) => {
+      docs.map(async (doc) => {
         const ok = await sendOne(doc.data().subscription, payload);
         if (!ok) dead.push(doc.ref);
       })
     );
-    console.log(`[push] notifyAllAdmins: sent to ${snap.size - dead.length}/${snap.size} central-admin device(s)`);
+    console.log(`[push] notifyAllAdmins: sent to ${docs.length - dead.length}/${docs.length} device(s)${devMode.enabled ? " (Development Mode — developer only)" : ""}`);
     if (dead.length) {
       const batch = db.batch();
       dead.forEach((ref) => batch.delete(ref));
