@@ -52,13 +52,13 @@ router.get("/dev-mode", requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Couldn't load Development Mode status." });
+    res.status(500).json({ error: "Couldn't load Testing Mode status." });
   }
 });
 
 router.post("/dev-mode/enable", requireAdmin, async (req, res) => {
   if (req.adminPasswordType !== "central") {
-    return res.status(403).json({ error: "Unlock admin with the central password to turn on Development Mode." });
+    return res.status(403).json({ error: "Unlock admin with the central password to turn on Testing Mode." });
   }
   try {
     const developerName = req.user.username || req.user.mobile;
@@ -72,13 +72,13 @@ router.post("/dev-mode/enable", requireAdmin, async (req, res) => {
     res.json({ ok: true, enabled: true, developerName });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Couldn't turn on Development Mode." });
+    res.status(500).json({ error: "Couldn't turn on Testing Mode." });
   }
 });
 
 router.post("/dev-mode/disable", requireAdmin, async (req, res) => {
   if (req.adminPasswordType !== "central") {
-    return res.status(403).json({ error: "Unlock admin with the central password to turn off Development Mode." });
+    return res.status(403).json({ error: "Unlock admin with the central password to turn off Testing Mode." });
   }
   try {
     await devModeDoc.set(
@@ -89,7 +89,7 @@ router.post("/dev-mode/disable", requireAdmin, async (req, res) => {
     res.json({ ok: true, enabled: false });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Couldn't turn off Development Mode." });
+    res.status(500).json({ error: "Couldn't turn off Testing Mode." });
   }
 });
 
