@@ -1,7 +1,13 @@
 const express = require("express");
 const db = require("../db");
-const { requireAdmin } = require("../utils/auth");
+const { requireAdmin, requirePin } = require("../utils/auth");
 const { invalidate } = require("../utils/cache");
+
+/* Every route here now sits behind requireAdmin AND requirePin — the
+   customer directory (names, emails, mobiles, spend) is exactly the
+   kind of data the Privacy PIN feature exists to gate on top of the
+   ordinary admin password. See utils/auth.js's requirePin/verifyPinToken
+   and routes/pin.js for how the PIN itself is verified and issued. */
 
 const router = express.Router();
 const usersCol = db.collection("users");
@@ -52,7 +58,7 @@ async function loadUsersWithStats() {
 /* Top-of-panel counters: total registered accounts, and how many of them
    have placed at least one order (each user counted once, regardless of
    how many orders they've placed). */
-router.get("/stats", requireAdmin, async (req, res) => {
+router.get("/stats", requireAdmin, requirePin, async (req, res) => {
   try {
     const users = await loadUsersWithStats();
     const totalRegistered = users.length;
@@ -73,7 +79,7 @@ router.get("/stats", requireAdmin, async (req, res) => {
    - sort: "recent" (default, newest first), "orders" (most orders placed,
      cancelled ones excluded), or "spent" (highest total amount ordered,
      cancelled ones excluded). */
-router.get("/", requireAdmin, async (req, res) => {
+router.get("/", requireAdmin, requirePin, async (req, res) => {
   try {
     const q = String(req.query.q || "").trim().toLowerCase();
     const sort = String(req.query.sort || "recent");
@@ -105,7 +111,7 @@ router.get("/", requireAdmin, async (req, res) => {
   }
 });
 
-router.get("/:id", requireAdmin, async (req, res) => {
+router.get("/:id", requireAdmin, requirePin, async (req, res) => {
   try {
     const doc = await usersCol.doc(req.params.id).get();
     if (!doc.exists) return res.status(404).json({ error: "Customer not found." });
@@ -148,7 +154,7 @@ router.get("/:id", requireAdmin, async (req, res) => {
 /* Blocks a customer's account: they can no longer log in, and (via
    requireAuth's own blocked check) any session they already hold stops
    working on the very next request. Doesn't touch their order history. */
-router.patch("/:id/block", requireAdmin, async (req, res) => {
+router.patch("/:id/block", requireAdmin, requirePin, async (req, res) => {
   try {
     if (req.params.id === req.user.id) {
       return res.status(400).json({ error: "You can't block your own account." });
@@ -165,7 +171,7 @@ router.patch("/:id/block", requireAdmin, async (req, res) => {
   }
 });
 
-router.patch("/:id/unblock", requireAdmin, async (req, res) => {
+router.patch("/:id/unblock", requireAdmin, requirePin, async (req, res) => {
   try {
     const ref = usersCol.doc(req.params.id);
     const doc = await ref.get();
@@ -183,7 +189,7 @@ router.patch("/:id/unblock", requireAdmin, async (req, res) => {
    history and lifts any block, but keeps the login itself (mobile,
    email, password) so they don't have to sign up again — the account
    behaves exactly like a brand-new registration afterward. */
-router.patch("/:id/clear-data", requireAdmin, async (req, res) => {
+router.patch("/:id/clear-data", requireAdmin, requirePin, async (req, res) => {
   try {
     const ref = usersCol.doc(req.params.id);
     const doc = await ref.get();
@@ -206,7 +212,7 @@ router.patch("/:id/clear-data", requireAdmin, async (req, res) => {
 /* Permanently removes the account. Their past orders are left untouched
    (they're the restaurant's own historical records, not the account's),
    so this only deletes the login/profile itself. */
-router.delete("/:id", requireAdmin, async (req, res) => {
+router.delete("/:id", requireAdmin, requirePin, async (req, res) => {
   try {
     if (req.params.id === req.user.id) {
       return res.status(400).json({ error: "You can't remove your own account." });

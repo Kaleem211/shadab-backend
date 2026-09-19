@@ -1,20 +1,49 @@
 const express = require("express");
 const db = require("../db");
-const { requireAdmin } = require("../utils/auth");
+const { requireAdmin, requirePin, verifyPinToken } = require("../utils/auth");
 
 const router = express.Router();
 const menuCol = db.collection("menuOverrides");
 
-/* Public: get all menu overrides (edited/added items) */
+/* Public: get all menu overrides (edited/added items).
+   profitMargin is stripped out here — it's the Privacy PIN's business,
+   never the public's. Anyone (a customer's browser, an unauthenticated
+   request) can hit this endpoint, so it must never leak what the
+   restaurant earns per item. The admin dashboard's own Menu tab gets
+   margins separately, only once the PIN is unlocked — see GET /margins
+   below. */
 router.get("/", async (req, res) => {
   try {
     const snap = await menuCol.get();
     const items = [];
-    snap.forEach((doc) => items.push(doc.data()));
+    snap.forEach((doc) => {
+      const { profitMargin, ...rest } = doc.data();
+      items.push(rest);
+    });
     res.json({ ok: true, items });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Couldn't load menu overrides." });
+  }
+});
+
+/* Admin + Privacy PIN only: the profit margin for every item, keyed by
+   id. Kept as a separate endpoint (rather than a flag on GET /) so the
+   public/customer-facing catalog call above can never accidentally
+   start including margins again — the only way to get them is this
+   route, and it's gated the same way Customers/Revenue are. */
+router.get("/margins", requireAdmin, requirePin, async (req, res) => {
+  try {
+    const snap = await menuCol.get();
+    const margins = {};
+    snap.forEach((doc) => {
+      const d = doc.data();
+      margins[d.id] = (d.profitMargin != null && d.profitMargin !== "") ? d.profitMargin : null;
+    });
+    res.json({ ok: true, margins });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't load profit margins." });
   }
 });
 
@@ -23,6 +52,27 @@ router.put("/:id", requireAdmin, async (req, res) => {
   try {
     const id = req.params.id;
     const body = req.body || {};
+
+    // Fetched up front (not just where it was previously read, further
+    // down) so it's available for the profit-margin-changed check below
+    // as well as the merge at the end.
+    const existingDoc = await menuCol.doc(id).get();
+    const existingData = existingDoc.exists ? existingDoc.data() : {};
+
+    // The profit margin is Privacy-PIN-gated: viewing AND editing it
+    // both require the PIN, on top of the ordinary admin password.
+    // Scoped to only when the margin is actually CHANGING (not just
+    // present in the payload) so routine saves that merely carry the
+    // margin through unchanged — e.g. hiding/un-hiding an item, see
+    // deleteItem() in the frontend — never get blocked by a PIN prompt
+    // for a value nobody is touching.
+    const incomingMargin = body.profitMargin === undefined ? undefined : (body.profitMargin === "" ? null : body.profitMargin);
+    const existingMargin = (existingData.profitMargin === undefined || existingData.profitMargin === "") ? null : existingData.profitMargin;
+    const marginChanging = incomingMargin !== undefined && Number(incomingMargin) !== Number(existingMargin || 0) && !(incomingMargin == null && existingMargin == null);
+    if (marginChanging) {
+      const pinCheck = await verifyPinToken(req);
+      if (!pinCheck.ok) return res.status(pinCheck.status).json({ error: pinCheck.message, code: pinCheck.code });
+    }
 
     // This doc is now what order totals are priced against server-side
     // (see utils/menuCatalog.js), so a bad price here isn't just a display
@@ -62,8 +112,8 @@ router.put("/:id", requireAdmin, async (req, res) => {
     // Merging means any field the caller doesn't mention is left alone;
     // a field they DO send (including profitMargin: null, e.g. clearing
     // the margin in the item form) still overwrites as before.
-    const existingDoc = await menuCol.doc(id).get();
-    const existingData = existingDoc.exists ? existingDoc.data() : {};
+    // (existingDoc/existingData were already fetched above, for the
+    // margin-changed check.)
     const data = { ...existingData, ...body, id };
     await menuCol.doc(id).set(data);
     res.json({ ok: true, item: data });

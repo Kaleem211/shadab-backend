@@ -1,7 +1,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const db = require("../db");
-const { requireAuth, requireAdmin } = require("../utils/auth");
+const { requireAuth, requireAdmin, requirePin } = require("../utils/auth");
 const { getOrderableMenu } = require("../utils/menuCatalog");
 const { getOrFetch, invalidate } = require("../utils/cache");
 const { notifyCustomer, notifyAllAdmins, itemSummary } = require("../utils/push");
@@ -1410,7 +1410,7 @@ function matchInfoForOrderItem(it, catalog, nameIndex) {
    - profit: amount - paidToRestaurant — what the admin actually keeps.
    An item with no margin configured (ever) still falls back to cost ===
    price (zero profit on that item) rather than inventing one. */
-router.get("/revenue", requireAdmin, async (req, res) => {
+router.get("/revenue", requireAdmin, requirePin, async (req, res) => {
   try {
     const week = currentWeekRange();
     const isValidDateKey = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
@@ -1473,7 +1473,7 @@ router.get("/revenue", requireAdmin, async (req, res) => {
    currentCostForOrderItem() above), and the profit — so these rows always
    add up to exactly that day's amount/paidToRestaurant/profit in the
    Revenue list above. */
-router.get("/revenue/day", requireAdmin, async (req, res) => {
+router.get("/revenue/day", requireAdmin, requirePin, async (req, res) => {
   try {
     const isValidDateKey = (v) => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
     const date = req.query.date;
