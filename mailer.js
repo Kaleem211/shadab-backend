@@ -5,10 +5,14 @@ const BREVO_API_KEY = process.env.BREVO_API_KEY;
 async function sendOtpEmail(to, code, purpose) {
   const subject = purpose === "reset"
     ? "Your password reset code"
+    : purpose === "pin-reset"
+    ? "Your Privacy PIN recovery code"
     : "Verify your email — Shadab Restaurant";
 
   const heading = purpose === "reset"
     ? "Reset your password"
+    : purpose === "pin-reset"
+    ? "Recover your Privacy PIN"
     : "Welcome to Shadab Restaurant";
 
   const html = `

@@ -12,6 +12,7 @@ const settingsRoutes = require("./routes/settings");
 const adminsRoutes = require("./routes/admins");
 const customersRoutes = require("./routes/customers");
 const pushRoutes = require("./routes/push");
+const pinRoutes = require("./routes/pin");
 // Fail fast with a clear message if required secrets are missing.
 ["GMAIL_USER", "GMAIL_APP_PASSWORD", "JWT_SECRET", "ADMIN_PASSWORD"].forEach((k) => {
   if (!process.env[k]) {
@@ -60,6 +61,7 @@ app.use("/api/settings", settingsRoutes);
 app.use("/api/admins", adminsRoutes);
 app.use("/api/customers", customersRoutes);
 app.use("/api/push", pushRoutes);
+app.use("/api/pin", pinRoutes);
 
 app.use((err, req, res, next) => {
   console.error(err);
