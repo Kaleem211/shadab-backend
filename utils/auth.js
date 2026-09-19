@@ -213,8 +213,105 @@ function genOtp() {
   return String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
 }
 
+/* =========================================================
+   PRIVACY PIN SYSTEM
+   A second, independent gate sitting IN FRONT OF the admin dashboard's
+   most sensitive data — the Customers directory and the Revenue report
+   (and, on the menu side, each item's profit margin). Getting past
+   requireAdmin above only proves someone knows the shared admin
+   password; it says nothing about whether they should also see every
+   customer's contact details or exactly how much profit is being made
+   per order. The Privacy PIN is that second, narrower check.
+
+   Stored the same way the admin passwords are — bcrypt-hashed, never in
+   plaintext, in its own Firestore doc kept out of the public `settings`
+   collection — and seeded once from a temporary default so the feature
+   works immediately after deploy, until the owner sets a real one from
+   the dashboard. */
+const pinSecurityDoc = db.collection("adminSecurity").doc("pinConfig");
+const LEGACY_DEFAULT_PIN = process.env.ADMIN_PRIVACY_PIN || "474747";
+const PIN_SECURITY_CACHE_KEY = "pin-security-doc";
+const pinAccessCol = db.collection("pinAccess");
+
+function isValidPin(pin) {
+  return /^\d{6}$/.test(String(pin || ""));
+}
+
+async function getPinSecurity() {
+  return getOrFetch(PIN_SECURITY_CACHE_KEY, 15000, async () => {
+    const doc = await pinSecurityDoc.get();
+    if (doc.exists && doc.data().pinHash) return doc.data();
+    // First run: seed from the temporary default PIN so the feature is
+    // usable the moment it ships, without forcing an owner to configure
+    // anything before the dashboard even loads.
+    const seedHash = await hashPassword(LEGACY_DEFAULT_PIN);
+    const seeded = { pinHash: seedHash, updatedAt: new Date().toISOString() };
+    await pinSecurityDoc.set(seeded, { merge: true });
+    return seeded;
+  });
+}
+
+function invalidatePinSecurityCache() {
+  invalidate(PIN_SECURITY_CACHE_KEY);
+}
+
+/* A Privacy PIN unlock is short-lived (20 minutes) and travels in its
+   own header (X-Privacy-Pin-Token) — completely separate from the
+   30-day login JWT and from the admin password header. This is what
+   makes it a real second factor rather than just another password:
+   even a device that's permanently unlocked admin (central password in
+   localStorage) still has to re-enter the PIN periodically to keep
+   touching customer/revenue data. */
+function signPinToken(identity) {
+  return jwt.sign(
+    { id: identity.id, mobile: identity.mobile, pin: true },
+    JWT_SECRET,
+    { expiresIn: "20m" }
+  );
+}
+
+/* Verifies the X-Privacy-Pin-Token header without short-circuiting the
+   response itself — callers that only need the PIN gate on PART of a
+   request (e.g. saving a menu item only when its profit margin is
+   actually changing) can check the result and decide what to do,
+   instead of the whole route always requiring it. requirePin() below is
+   the drop-in middleware for routes that need it on every request. */
+async function verifyPinToken(req) {
+  const header = req.headers["x-privacy-pin-token"] || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : header;
+  if (!token) {
+    return { ok: false, status: 401, code: "pin_required", message: "Privacy PIN verification required." };
+  }
+  let payload;
+  try {
+    payload = jwt.verify(token, JWT_SECRET);
+  } catch {
+    return { ok: false, status: 401, code: "pin_expired", message: "Privacy PIN session expired. Verify the PIN again." };
+  }
+  if (!payload || !payload.pin) {
+    return { ok: false, status: 401, code: "pin_invalid", message: "Invalid Privacy PIN session." };
+  }
+  try {
+    const doc = await pinAccessCol.doc(payload.mobile).get();
+    if (doc.exists && doc.data().blocked) {
+      return { ok: false, status: 403, code: "pin_blocked", message: "Your Privacy PIN access has been blocked by another admin." };
+    }
+  } catch (err) {
+    console.error("Privacy PIN block-status check failed:", err);
+  }
+  return { ok: true, pinUser: payload };
+}
+
+async function requirePin(req, res, next) {
+  const result = await verifyPinToken(req);
+  if (!result.ok) return res.status(result.status).json({ error: result.message, code: result.code });
+  req.pinUser = result.pinUser;
+  next();
+}
+
 module.exports = {
   signToken, requireAuth, requireAdmin, hashPassword, checkPassword, genOtp,
   getAdminSecurity, invalidateAdminSecurityCache, passwordStrength, assertStrongEnough,
+  isValidPin, getPinSecurity, invalidatePinSecurityCache, signPinToken, verifyPinToken, requirePin,
 };
   
